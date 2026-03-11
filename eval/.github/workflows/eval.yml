@@ -1,0 +1,68 @@
+name: Run Eval
+
+on:
+  workflow_dispatch:
+    inputs:
+      llm:
+        description: "LLM module name (gemini, claude, openai, local)"
+        type: choice
+        options:
+          - gemini
+          - claude
+          - openai
+          - local
+        required: true
+      task_ids:
+        description: "Comma-separated task IDs (blank = all)"
+        type: string
+        required: false
+      s3_bucket:
+        description: "S3 bucket for result persistence"
+        type: string
+        required: true
+      s3_prefix:
+        description: "S3 key prefix"
+        type: string
+        default: "eval"
+      wandb_project:
+        description: "W&B project name"
+        type: string
+        default: "eval"
+      output:
+        description: "Output filename (reuse to resume interrupted run)"
+        type: string
+        required: false
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+
+      - run: uv venv && uv pip install -r requirements.txt
+        shell: bash
+
+      - name: Run eval
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+        run: |
+          source .venv/bin/activate
+          ARGS="--llm llms/${{ inputs.llm }}.py --s3-bucket ${{ inputs.s3_bucket }} --s3-prefix ${{ inputs.s3_prefix }} --wandb-project ${{ inputs.wandb_project }}"
+          if [ -n "${{ inputs.task_ids }}" ]; then
+            ARGS="$ARGS --ids ${{ inputs.task_ids }}"
+          fi
+          if [ -n "${{ inputs.output }}" ]; then
+            ARGS="$ARGS --output ${{ inputs.output }}"
+          fi
+          python run.py $ARGS
+        shell: bash

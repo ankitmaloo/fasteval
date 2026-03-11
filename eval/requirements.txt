@@ -1,0 +1,17 @@
+google-genai
+python-dotenv
+boto3
+wandb
+weave
+fastapi
+uvicorn
+openai
+anthropic
+requests
+openpyxl
+pandas
+numpy
+python-docx
+huggingface-hub
+PyYAML
+exa-py

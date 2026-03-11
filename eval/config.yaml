@@ -1,0 +1,50 @@
+# Default eval config. CLI args override these values.
+dataset: null
+output: null
+ids: null
+s3_bucket: null
+s3_prefix: eval
+wandb_project: null
+weave_project: null
+
+# Active provider (pass --provider on CLI to switch)
+provider: kimi
+
+# Provider configs — add new providers here
+# llm: path to the LLM module
+# Remaining keys are provider-specific (base_url/api_key/model for oaichat)
+providers:
+  # --- OpenAI-compatible (oaichat) ---
+  kimi:
+    llm: eval/llms/oaichat.py
+    base_url: https://api.moonshot.ai/v1
+    api_key: ${MOONSHOT_API_KEY}
+    model: kimi-k2.5
+
+  qwen:
+    llm: eval/llms/oaichat.py
+    base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+    api_key: ${DASHSCOPE_API_KEY}
+    model: qwen-max
+
+  deepseek:
+    llm: eval/llms/oaichat.py
+    base_url: https://api.deepseek.com/v1
+    api_key: ${DEEPSEEK_API_KEY}
+    model: deepseek-chat
+
+  mistral:
+    llm: eval/llms/oaichat.py
+    base_url: https://api.mistral.ai/v1
+    api_key: ${MISTRAL_API_KEY}
+    model: mistral-large-latest
+
+  # --- Native providers ---
+  gemini:
+    llm: eval/llms/gemini.py
+
+  openai:
+    llm: eval/llms/openai.py
+
+  claude:
+    llm: eval/llms/claude.py
