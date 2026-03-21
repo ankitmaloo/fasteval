@@ -34,7 +34,7 @@ htmlcov/
 
 # Local environment/config overrides
 .env
-.env.*
+.env.
 *.local
 
 # Benchmark runtime outputs
