@@ -7,6 +7,7 @@ Defaults live in eval/config.yaml, CLI args override.
 import json
 import os
 import asyncio
+
 from openai import OpenAI, AsyncOpenAI
 from dotenv import load_dotenv
 
@@ -45,6 +46,9 @@ _api_key = os.environ.get("OAICHAT_API_KEY")
 _model = os.environ.get("OAICHAT_MODEL")
 assert _base_url and _api_key and _model, "OAICHAT_BASE_URL, OAICHAT_API_KEY, OAICHAT_MODEL must be set (via config.yaml + run.py)"
 
+_extra_body_raw = os.environ.get("OAICHAT_EXTRA_BODY")
+_extra_body = json.loads(_extra_body_raw) if _extra_body_raw else None
+
 _client = OpenAI(base_url=_base_url, api_key=_api_key)
 _async_client = AsyncOpenAI(base_url=_base_url, api_key=_api_key)
 
@@ -62,6 +66,47 @@ def _extract_thinking(choice: dict) -> str | None:
         if msg.get(key):
             return msg[key]
     return None
+
+
+_KNOWN_TOOLS = {"execute_code", "bash", "search"}
+
+import re
+
+_TOOL_CALL_TAG_RE = re.compile(r"</?tool_call>|</?arg_key>|</?arg_value>")
+
+
+def _strip_tool_tags(text: str) -> str:
+    """Strip spurious <tool_call>/<arg_key>/<arg_value> tags from content text."""
+    return _TOOL_CALL_TAG_RE.sub("", text).strip()
+
+
+def _parse_tool_call(fn: dict) -> tuple[str, dict, bool]:
+    """Parse a tool call, handling models that mangle the function name/args.
+
+    Returns (canonical_name, args_dict, is_malformed).
+    """
+    raw_name = fn["name"]
+    raw_args = fn["arguments"]
+
+    # Try normal parse first
+    try:
+        args = json.loads(raw_args)
+    except (json.JSONDecodeError, TypeError):
+        args = {}
+
+    # Determine canonical tool name
+    canonical = raw_name
+    for name in _KNOWN_TOOLS:
+        if raw_name == name or raw_name.startswith(name + "<") or raw_name.startswith(name + "</"):
+            canonical = name
+            break
+
+    # Detect malformed: name contains XML-like tags, or args are empty when they shouldn't be
+    malformed = canonical != raw_name or "<arg" in raw_name or "</arg" in raw_name
+    if canonical in ("execute_code", "bash") and not args:
+        malformed = True
+
+    return canonical, args, malformed
 
 
 def _build_tools(config: dict) -> list[dict]:
@@ -84,9 +129,16 @@ def _accumulate_usage(usage_total: dict[str, int | float], resp_usage: dict) -> 
             usage_total[k] += v
 
 
+def _append_conv(config: dict, entry: dict) -> None:
+    store = config.get("_conv_store")
+    tid = config.get("_task_id", "")
+    if store and tid:
+        store.append(tid, entry)
+
+
 def _final_payload(text: str, model: str, usage_total: dict, turns: list[dict], turn_idx: int) -> dict:
     return {
-        "text": text,
+        "text": _strip_tool_tags(text),
         "metadata": {
             "model": model,
             "usage": usage_total,
@@ -98,19 +150,25 @@ def _final_payload(text: str, model: str, usage_total: dict, turns: list[dict], 
 
 def generate(task: str, references: dict, config: dict) -> dict:
     from eval.core import build_prompt
-    import os
     _odir = config.get("_output_dir")
-    _tid = config.get("_task_id")
-    _ofile = os.path.join(_odir, _tid) if _odir and _tid else _odir
-    prompt = build_prompt(task, references, output_file=_ofile)
+    prompt = build_prompt(
+        task,
+        references,
+        output_file=_odir,
+        extra_instructions=config.get("_prompt_repl_note"),
+    )
     task_repl = config.get("_repl")
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
 
     tools = _build_tools(config)
 
+
     usage_total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     turns = []
+
+    _append_conv(config, {"turn": 0, "role": "system", "content": SYSTEM_PROMPT})
+    _append_conv(config, {"turn": 0, "role": "user", "content": prompt})
 
     for turn_idx in range(MAX_TURNS):
         log.info(f"    [oaichat] turn {turn_idx}")
@@ -118,31 +176,33 @@ def generate(task: str, references: dict, config: dict) -> dict:
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
+        if _extra_body:
+            kwargs["extra_body"] = _extra_body
         resp = _client.chat.completions.create(**kwargs)
         raw = resp.model_dump()
         choice = raw["choices"][0]
         msg = choice["message"]
 
-        # Accumulate usage
         resp_usage = raw.get("usage") or {}
         _accumulate_usage(usage_total, resp_usage)
 
-        # Capture turn data
+        thinking = _extract_thinking(choice)
         turn_data = {
             "turn": turn_idx,
             "finish_reason": choice.get("finish_reason"),
-            "thinking": _extract_thinking(choice),
+            "thinking": thinking,
             "usage": resp_usage or None,
         }
 
         tool_calls = msg.get("tool_calls")
         if not tool_calls:
             log.info(f" -> done (finish={choice.get('finish_reason')})")
-            turn_data["content"] = msg.get("content", "")
+            turn_data["content"] = msg.get("content") or ""
             turns.append(turn_data)
+            _append_conv(config, {"turn": turn_idx, "role": "assistant", "content": msg.get("content") or "", "thinking": thinking})
 
             return _final_payload(
-                msg.get("content", ""),
+                msg.get("content") or "",
                 raw.get("model", _model),
                 usage_total,
                 turns,
@@ -152,54 +212,64 @@ def generate(task: str, references: dict, config: dict) -> dict:
         # Append assistant message
         messages.append(msg)
 
+        # Log assistant tool calls
+        tc_log = [{"name": tc["function"]["name"], "arguments": tc["function"]["arguments"], "id": tc["id"]} for tc in tool_calls]
+        _append_conv(config, {"turn": turn_idx, "role": "assistant", "tool_calls": tc_log, "thinking": thinking})
+
         # Execute tools
         tool_results = []
-        tool_names = [tc["function"]["name"] for tc in tool_calls]
-        log.info(f" -> tools: {tool_names}")
         for tc in tool_calls:
             fn = tc["function"]
-            args = json.loads(fn["arguments"])
-            if fn["name"] == "execute_code":
+            name, args, malformed = _parse_tool_call(fn)
+            log.info(f" -> tool: {name} (malformed={malformed})")
+            if malformed:
+                result = (
+                    "[ERROR] Malformed tool call. Your function call was not properly formatted. "
+                    "Please retry using the standard JSON arguments format. "
+                    f"Expected tool '{name}' with proper JSON arguments."
+                )
+            elif name == "execute_code":
                 result = execute_code(args.get("code", ""), repl_instance=task_repl)
-            elif fn["name"] == "bash":
-                result = execute_bash(args.get("command", ""))
-            elif fn["name"] == "search":
+            elif name == "bash":
+                result = execute_bash(args.get("command", ""), cwd=_odir)
+            elif name == "search":
                 result = _exa_search(args.get("query", ""))
             else:
                 result = f"[Unknown tool: {fn['name']}]"
             messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
-            tool_results.append({"tool": fn["name"], "args": fn["arguments"], "result_len": len(result)})
+            tool_results.append({"tool": name, "args": fn["arguments"], "result_len": len(result), "malformed": malformed})
+            _append_conv(config, {"turn": turn_idx, "role": "tool", "name": name, "call_id": tc["id"], "result": result, "malformed": malformed})
 
         turn_data["tool_calls"] = tool_results
         turns.append(turn_data)
 
     # Exhausted turns
-    last_content = msg.get("content", "") if msg else ""
-    return {
-        "text": last_content,
-        "metadata": {
-            "model": raw.get("model", _model),
-            "usage": usage_total,
-            "turns": turns,
-            "total_turns": MAX_TURNS,
-            "exhausted": True,
-        },
-    }
+    last_content = (msg.get("content") or "") if msg else ""
+    _append_conv(config, {"turn": MAX_TURNS, "role": "assistant", "content": last_content, "exhausted": True})
+    result = _final_payload(last_content, raw.get("model", _model), usage_total, turns, MAX_TURNS - 1)
+    result["metadata"]["exhausted"] = True
+    return result
 
 
 async def generate_async(task: str, references: dict, config: dict) -> dict:
     from eval.core import build_prompt
-    import os
     _odir = config.get("_output_dir")
-    _tid = config.get("_task_id")
-    _ofile = os.path.join(_odir, _tid) if _odir and _tid else _odir
-    prompt = build_prompt(task, references, output_file=_ofile)
+    prompt = build_prompt(
+        task,
+        references,
+        output_file=_odir,
+        extra_instructions=config.get("_prompt_repl_note"),
+    )
     task_repl = config.get("_repl")
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
     tools = _build_tools(config)
+
     usage_total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     turns = []
+
+    _append_conv(config, {"turn": 0, "role": "system", "content": SYSTEM_PROMPT})
+    _append_conv(config, {"turn": 0, "role": "user", "content": prompt})
 
     for turn_idx in range(MAX_TURNS):
         log.info(f"    [oaichat] turn {turn_idx}")
@@ -207,6 +277,8 @@ async def generate_async(task: str, references: dict, config: dict) -> dict:
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
+        if _extra_body:
+            kwargs["extra_body"] = _extra_body
         resp = await _async_client.chat.completions.create(**kwargs)
         raw = resp.model_dump()
         choice = raw["choices"][0]
@@ -215,20 +287,23 @@ async def generate_async(task: str, references: dict, config: dict) -> dict:
         resp_usage = raw.get("usage") or {}
         _accumulate_usage(usage_total, resp_usage)
 
+        thinking = _extract_thinking(choice)
         turn_data = {
             "turn": turn_idx,
             "finish_reason": choice.get("finish_reason"),
-            "thinking": _extract_thinking(choice),
+            "thinking": thinking,
             "usage": resp_usage or None,
         }
 
         tool_calls = msg.get("tool_calls")
         if not tool_calls:
             log.info(f" -> done (finish={choice.get('finish_reason')})")
-            turn_data["content"] = msg.get("content", "")
+            turn_data["content"] = msg.get("content") or ""
             turns.append(turn_data)
+            _append_conv(config, {"turn": turn_idx, "role": "assistant", "content": msg.get("content") or "", "thinking": thinking})
+
             return _final_payload(
-                msg.get("content", ""),
+                msg.get("content") or "",
                 raw.get("model", _model),
                 usage_total,
                 turns,
@@ -237,39 +312,42 @@ async def generate_async(task: str, references: dict, config: dict) -> dict:
 
         messages.append(msg)
 
+        tc_log = [{"name": tc["function"]["name"], "arguments": tc["function"]["arguments"], "id": tc["id"]} for tc in tool_calls]
+        _append_conv(config, {"turn": turn_idx, "role": "assistant", "tool_calls": tc_log, "thinking": thinking})
+
         tool_results = []
-        tool_names = [tc["function"]["name"] for tc in tool_calls]
-        log.info(f" -> tools: {tool_names}")
         for tc in tool_calls:
             fn = tc["function"]
-            args = json.loads(fn["arguments"])
-            if fn["name"] == "execute_code":
+            name, args, malformed = _parse_tool_call(fn)
+            log.info(f" -> tool: {name} (malformed={malformed})")
+            if malformed:
+                result = (
+                    "[ERROR] Malformed tool call. Your function call was not properly formatted. "
+                    "Please retry using the standard JSON arguments format. "
+                    f"Expected tool '{name}' with proper JSON arguments."
+                )
+            elif name == "execute_code":
                 result = await asyncio.to_thread(
                     execute_code, args.get("code", ""), repl_instance=task_repl
                 )
-            elif fn["name"] == "bash":
-                result = await asyncio.to_thread(execute_bash, args.get("command", ""))
-            elif fn["name"] == "search":
+            elif name == "bash":
+                result = await asyncio.to_thread(execute_bash, args.get("command", ""), cwd=_odir)
+            elif name == "search":
                 result = await asyncio.to_thread(_exa_search, args.get("query", ""))
             else:
                 result = f"[Unknown tool: {fn['name']}]"
             messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
-            tool_results.append({"tool": fn["name"], "args": fn["arguments"], "result_len": len(result)})
+            tool_results.append({"tool": name, "args": fn["arguments"], "result_len": len(result), "malformed": malformed})
+            _append_conv(config, {"turn": turn_idx, "role": "tool", "name": name, "call_id": tc["id"], "result": result, "malformed": malformed})
 
         turn_data["tool_calls"] = tool_results
         turns.append(turn_data)
 
-    last_content = msg.get("content", "") if msg else ""
-    return {
-        "text": last_content,
-        "metadata": {
-            "model": raw.get("model", _model),
-            "usage": usage_total,
-            "turns": turns,
-            "total_turns": MAX_TURNS,
-            "exhausted": True,
-        },
-    }
+    last_content = (msg.get("content") or "") if msg else ""
+    _append_conv(config, {"turn": MAX_TURNS, "role": "assistant", "content": last_content, "exhausted": True})
+    result = _final_payload(last_content, raw.get("model", _model), usage_total, turns, MAX_TURNS - 1)
+    result["metadata"]["exhausted"] = True
+    return result
 
 
 def generate_batch(prompts: list[str], configs: list[dict]) -> list[dict]:

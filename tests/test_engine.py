@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import textwrap
+import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -441,14 +443,61 @@ class TestBuildJudgedAnswer:
 
         task = _make_task(output_dir=str(out_dir.relative_to(tmp_path)))
         with patch("eval.core._resolve_output_dir", return_value=out_dir):
-            with patch(
-                "eval.core._collect_output_files",
-                return_value={"inline": "hello world", "paths": []},
-            ):
-                result = _build_judged_answer(task, "answer")
+            result = _build_judged_answer(task, "answer")
         assert "answer" in result
         assert "hello world" in result
-        assert "OUTPUT FILES" in result
+        assert "ARTIFACT CONTEXT" in result
+
+
+class TestOutputArtifactHandling:
+    def test_collect_output_files_recurses_under_artifact_root(self, tmp_path: Path) -> None:
+        from eval.core import _collect_output_files
+
+        out_dir = tmp_path / "artifact"
+        nested = out_dir / "nested"
+        nested.mkdir(parents=True)
+        (nested / "report.txt").write_text("nested hello")
+
+        collected = _collect_output_files(out_dir)
+
+        assert "nested/report.txt" in collected["inline"]
+        assert "nested hello" in collected["inline"]
+
+    def test_build_judge_artifact_bundle_collects_manifest_and_preloads(self, tmp_path: Path) -> None:
+        from eval.core import build_judge_artifact_bundle
+
+        out_dir = tmp_path / "artifact"
+        nested = out_dir / "nested"
+        nested.mkdir(parents=True)
+        (nested / "report.txt").write_text("nested hello")
+
+        with patch("eval.core._resolve_output_dir", return_value=out_dir):
+            bundle = build_judge_artifact_bundle("artifact")
+
+        assert bundle["artifact_root"] == str(out_dir.resolve())
+        manifest_paths = [entry["relative_path"] for entry in bundle["manifest"]]
+        assert manifest_paths == ["nested/report.txt"]
+        assert "nested/report.txt" in bundle["prompt_context"]
+        assert "nested hello" in bundle["prompt_context"]
+        assert bundle["repl_seed"]["artifact_root"] == str(out_dir.resolve())
+        assert bundle["repl_seed"]["artifacts_text"]["nested/report.txt"] == "nested hello"
+        assert bundle["repl_seed"]["nested_report_text"] == "nested hello"
+
+    def test_prepare_task_output_dir_clears_nested_children(self, tmp_path: Path) -> None:
+        from service.engine import _prepare_task_output_dir
+
+        out_dir = tmp_path / "artifact" / "case-1"
+        nested = out_dir / "old"
+        nested.mkdir(parents=True)
+        (nested / "stale.txt").write_text("old data")
+
+        task = _make_task(tid="case-1", output_dir="artifact")
+        with patch("eval.core._resolve_output_dir", return_value=out_dir):
+            prepared = _prepare_task_output_dir(task)
+
+        assert prepared == str(out_dir)
+        assert out_dir.exists()
+        assert list(out_dir.iterdir()) == []
 
 
 # ---------------------------------------------------------------------------
@@ -493,6 +542,35 @@ class TestJudgeTaskWithRubric:
             with patch("eval.core.score_rubric", return_value=0.0):
                 result = _judge_task_with_rubric(task, "ans", criterion_workers=1)
         assert result["score"] == 0.0
+
+    def test_judge_receives_artifact_dir_for_repl(self, tmp_path: Path) -> None:
+        from service.engine import _judge_task_with_rubric
+
+        out_dir = tmp_path / "artifact" / "case-1"
+        out_dir.mkdir(parents=True)
+        (out_dir / "summary.txt").write_text("hello judge")
+        task = _make_task(
+            tid="case-1",
+            output_dir="artifact",
+            rubric={"mandatory": ["criterion"]},
+        )
+        captured: dict[str, Any] = {}
+
+        def fake_judge(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            captured.update(kwargs)
+            return {"mandatory": [True], "good_to_have": [], "ideal": []}
+
+        with patch("eval.core._resolve_output_dir", return_value=out_dir):
+            with patch("eval.core.judge_rubric", side_effect=fake_judge):
+                with patch("eval.core.score_rubric", return_value=0.4):
+                    result = _judge_task_with_rubric(task, "ans", criterion_workers=1)
+
+        assert result is not None
+        assert captured["output_dir"] == str(out_dir)
+        assert "artifact_context" in captured
+        assert "summary.txt" in captured["artifact_context"]
+        assert captured["repl_seed"]["artifact_root"] == str(out_dir)
+        assert captured["repl_seed"]["artifacts_text"]["summary.txt"] == "hello judge"
 
 
 # ---------------------------------------------------------------------------
@@ -638,6 +716,17 @@ class TestPythonREPL:
         assert len(out) <= MAX_OUTPUT + 100  # some slack for truncation message
         assert "TRUNCATED" in out
 
+    def test_timeout_is_enforced(self) -> None:
+        from eval.tools import PythonREPL
+
+        r = PythonREPL()
+        started = time.perf_counter()
+        out = r.run("while True:\n    pass", timeout=1)
+        elapsed = time.perf_counter() - started
+
+        assert "[TIMEOUT after 1s]" in out
+        assert elapsed < 3
+
     def test_repl_cwd_is_eval_dir(self) -> None:
         """REPL cwd must be eval/ so relative paths like 'artifacts/foo.xlsx' resolve to eval/artifacts/."""
         from eval.tools import PythonREPL
@@ -680,6 +769,31 @@ class TestPythonREPL:
         r = PythonREPL(seed_globals={"my_var": 123})
         out = r.run("print(my_var)")
         assert "123" in out
+
+    def test_output_dir_redirects_escaped_writes(self, tmp_path: Path) -> None:
+        from eval.tools import PythonREPL
+
+        out_dir = tmp_path / "artifact"
+        r = PythonREPL(output_dir=str(out_dir))
+        out = r.run("open('../escape.txt', 'w').write('hello'); print('done')")
+
+        assert "done" in out
+        assert not (tmp_path / "escape.txt").exists()
+        assert (out_dir / "escape.txt").read_text() == "hello"
+
+    def test_output_dir_nested_files_are_collected_for_judging(self, tmp_path: Path) -> None:
+        from eval.core import _collect_output_files
+        from eval.tools import PythonREPL
+
+        out_dir = tmp_path / "artifact"
+        r = PythonREPL(output_dir=str(out_dir))
+        out = r.run("open('reports/final.txt', 'w').write('nested hello'); print('done')")
+
+        collected = _collect_output_files(out_dir)
+
+        assert "done" in out
+        assert "reports/final.txt" in collected["inline"]
+        assert "nested hello" in collected["inline"]
 
 
 # ---------------------------------------------------------------------------
@@ -745,6 +859,115 @@ class TestOnCaseComplete:
 
         asyncio.run(runner.run_cases(cases, on_case_complete=_cb))
         assert collected == ["s1"]
+
+
+class TestProviderClientConstruction:
+    def test_load_provider_module_clears_stale_openai_env(self, monkeypatch: Any) -> None:
+        import service.engine as engine_mod
+
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        monkeypatch.setenv("OPENAI_MODEL", "nvidia/nemotron-3-super-120b-a12b")
+        monkeypatch.setenv("OPENAI_REASONING_EFFORT", "xhigh")
+
+        module = engine_mod._load_provider_module(
+            engine_mod.BASE_DIR / "eval" / "llms" / "openai.py",
+            {},
+        )
+
+        assert module.LLM_ID == "gpt-5.4"
+        assert "OPENAI_MODEL" not in os.environ
+        assert "OPENAI_REASONING_EFFORT" not in os.environ
+
+    def test_provider_case_context_seeds_docx_reference_data(self, tmp_path: Path, monkeypatch: Any) -> None:
+        import service.engine as engine_mod
+        import eval.core as core_mod
+        from docx import Document
+
+        refs_dir = tmp_path / "reference_files"
+        refs_dir.mkdir()
+        docx_path = refs_dir / "quotes.docx"
+
+        doc = Document()
+        doc.add_paragraph("Example quotation")
+        table = doc.add_table(rows=2, cols=2)
+        table.rows[0].cells[0].text = "Vendor"
+        table.rows[0].cells[1].text = "Price"
+        table.rows[1].cells[0].text = "Vendocrat"
+        table.rows[1].cells[1].text = "123"
+        doc.save(str(docx_path))
+
+        monkeypatch.setattr(engine_mod, "BASE_DIR", tmp_path)
+        monkeypatch.setattr(core_mod, "BASE_DIR", tmp_path)
+        monkeypatch.setattr(
+            engine_mod,
+            "_prepare_task_output_dir",
+            lambda task: str(tmp_path / "artifact" / str(task.get("id", ""))),
+        )
+
+        ctx = engine_mod._provider_case_context(
+            {"id": "case-docx", "task": "analyze", "reference_files": ["quotes.docx"]}
+        )
+
+        repl = ctx.config["_repl"]
+        seed = repl._seed_globals  # type: ignore[attr-defined]
+        assert seed is not None
+        assert "_reference_files" in seed
+        assert "quotes.docx" in seed["_reference_files"]
+        assert seed["_reference_files"]["quotes.docx"]["tables"][0][1] == ["Vendocrat", "123"]
+        assert "quotes_tables" in seed
+        assert "Do not try to reopen the original reference files from disk." in ctx.config["_prompt_repl_note"]
+        assert "`quotes_tables`" in ctx.config["_prompt_repl_note"]
+
+    def test_build_client_defers_provider_context_creation(self, monkeypatch: Any) -> None:
+        import service.engine as engine_mod
+
+        calls: list[str] = []
+
+        def fake_provider_case_context(
+            task: dict[str, Any], *, conv_store: Any = None
+        ) -> Any:
+            calls.append(str(task["id"]))
+            return engine_mod.ProviderCaseContext(
+                task_text=str(task["task"]),
+                references={},
+                config={},
+            )
+
+        class DemoProvider:
+            LLM_ID = "demo-provider"
+
+            @staticmethod
+            def generate(
+                task: str, references: dict[str, Any], config: dict[str, Any]
+            ) -> dict[str, Any]:
+                return {"text": task}
+
+        monkeypatch.setattr(engine_mod, "_provider_case_context", fake_provider_case_context)
+        monkeypatch.setattr(
+            engine_mod,
+            "_resolve_provider_module",
+            lambda provider, provider_config_path: (DemoProvider, provider),
+        )
+
+        llm_id, client = engine_mod._build_client(
+            engine_mod.AsyncRunConfig(client="provider", provider="demo"),
+            task_by_id={
+                "case-a": {"id": "case-a", "task": "Task A"},
+                "case-b": {"id": "case-b", "task": "Task B"},
+            },
+        )
+
+        assert llm_id == "demo-provider"
+        assert calls == []
+
+        async def _run_once() -> Any:
+            return await client.complete(
+                [{"role": "user", "content": "Task A", "case_id": "case-a", "step": 0}]
+            )
+
+        result = asyncio.run(_run_once())
+        assert result.text == "Task A"
+        assert calls == ["case-a"]
 
 
 # ---------------------------------------------------------------------------
@@ -1042,3 +1265,108 @@ class TestApiValidation:
         from service.api import _validate_request
 
         _validate_request(self._make_req())  # Should not raise
+
+
+# ---------------------------------------------------------------------------
+# ConvStore
+# ---------------------------------------------------------------------------
+
+class TestConvStore:
+    """Tests for the ConvStore in-memory conversation store."""
+
+    def test_append_and_flush(self, tmp_path: Path) -> None:
+        from service.engine import ConvStore
+
+        cf = tmp_path / "test.conv.jsonl"
+        store = ConvStore(cf)
+        store.append("kw_001", {"turn": 0, "role": "system", "content": "hello"})
+        store.append("kw_001", {"turn": 1, "role": "assistant", "content": "hi"})
+        assert not cf.exists()
+        store.flush()
+
+        lines = [json.loads(l) for l in cf.read_text().splitlines()]
+        assert len(lines) == 1
+        assert lines[0]["task_id"] == "kw_001"
+        assert len(lines[0]["conversation"]) == 2
+        assert lines[0]["conversation"][0]["role"] == "system"
+        assert lines[0]["conversation"][1]["role"] == "assistant"
+
+    def test_multiple_tasks(self, tmp_path: Path) -> None:
+        from service.engine import ConvStore
+
+        cf = tmp_path / "test.conv.jsonl"
+        store = ConvStore(cf)
+        store.append("kw_001", {"turn": 0, "role": "user", "content": "task1"})
+        store.append("kw_002", {"turn": 0, "role": "user", "content": "task2"})
+        store.append("kw_001", {"turn": 1, "role": "assistant", "content": "done1"})
+        store.flush()
+
+        lines = [json.loads(l) for l in cf.read_text().splitlines()]
+        assert len(lines) == 2
+        by_id = {l["task_id"]: l for l in lines}
+        assert len(by_id["kw_001"]["conversation"]) == 2
+        assert len(by_id["kw_002"]["conversation"]) == 1
+
+    def test_append_judge(self, tmp_path: Path) -> None:
+        from service.engine import ConvStore
+
+        cf = tmp_path / "test.conv.jsonl"
+        store = ConvStore(cf)
+        store.append("kw_001", {"turn": 0, "role": "user", "content": "task"})
+        store.append_judge("kw_001", {"tier": "mandatory", "verdict": "PASS"})
+        store.flush()
+
+        lines = [json.loads(l) for l in cf.read_text().splitlines()]
+        assert len(lines) == 1
+        assert len(lines[0]["conversation"]) == 1
+        assert len(lines[0]["judge"]) == 1
+        assert lines[0]["judge"][0]["verdict"] == "PASS"
+
+    def test_reload_uses_latest_snapshot_for_task(self, tmp_path: Path) -> None:
+        from service.engine import ConvStore
+
+        cf = tmp_path / "test.conv.jsonl"
+        store = ConvStore(cf)
+        store.append("kw_001", {"turn": 0, "role": "user", "content": "task"})
+        store.flush()
+
+        store.append("kw_001", {"turn": 1, "role": "assistant", "content": "done"})
+        store.append_judge("kw_001", {"tier": "mandatory", "verdict": "PASS"})
+        store.flush()
+
+        lines = [json.loads(l) for l in cf.read_text().splitlines()]
+        assert len(lines) == 2
+
+        reloaded = ConvStore(cf)
+        reloaded.append("kw_001", {"turn": 2, "role": "assistant", "content": "again"})
+        reloaded.flush()
+        latest = [json.loads(l) for l in cf.read_text().splitlines()][-1]
+        assert latest["task_id"] == "kw_001"
+        assert len(latest["conversation"]) == 3
+        assert len(latest["judge"]) == 1
+
+    def test_judge_task_passes_conv_store(self) -> None:
+        from service.engine import _judge_task_with_rubric, ConvStore
+
+        task = _make_task("t1", "solve", rubric={
+            "mandatory": ["m1"],
+            "good_to_have": [],
+            "ideal": [],
+        })
+        mock_eval = {"mandatory": [True], "good_to_have": [], "ideal": []}
+
+        captured = {}
+
+        def mock_judge_rubric(*args, **kwargs):
+            captured.update(kwargs)
+            return mock_eval
+
+        with patch("eval.core.judge_rubric", side_effect=mock_judge_rubric):
+            with patch("eval.core.score_rubric", return_value=0.4):
+                _judge_task_with_rubric(
+                    task, "answer", criterion_workers=1,
+                    conv_store=MagicMock(),
+                )
+
+        assert captured["conv_store"] is not None
+        assert captured["task_id"] == "t1"

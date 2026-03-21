@@ -105,11 +105,13 @@ async def _search_subagent_async(query: str) -> str:
 
 def generate(task: str, references: dict, config: dict) -> dict:
     from eval.core import build_prompt
-    import os
     _odir = config.get("_output_dir")
-    _tid = config.get("_task_id")
-    _ofile = os.path.join(_odir, _tid) if _odir and _tid else _odir
-    prompt = build_prompt(task, references, output_file=_ofile)
+    prompt = build_prompt(
+        task,
+        references,
+        output_file=_odir,
+        extra_instructions=config.get("_prompt_repl_note"),
+    )
     task_repl = config.get("_repl")
     tools = _build_tools(config)
 
@@ -151,7 +153,7 @@ def generate(task: str, references: dict, config: dict) -> dict:
             elif fc.name == "bash":
                 cmd = fc.args.get("command", "")
                 log.info(f"    [BASH]\n{cmd}")
-                result = execute_bash(cmd)
+                result = execute_bash(cmd, cwd=_odir)
                 log.info(f"    [BASH OUT] ({len(result)} chars)\n{result}")
             elif fc.name == "search":
                 query = fc.args.get("query", "")
@@ -170,11 +172,13 @@ def generate(task: str, references: dict, config: dict) -> dict:
 
 async def generate_async(task: str, references: dict, config: dict) -> dict:
     from eval.core import build_prompt
-    import os
     _odir = config.get("_output_dir")
-    _tid = config.get("_task_id")
-    _ofile = os.path.join(_odir, _tid) if _odir and _tid else _odir
-    prompt = build_prompt(task, references, output_file=_ofile)
+    prompt = build_prompt(
+        task,
+        references,
+        output_file=_odir,
+        extra_instructions=config.get("_prompt_repl_note"),
+    )
     task_repl = config.get("_repl")
     tools = _build_tools(config)
 
@@ -220,7 +224,7 @@ async def generate_async(task: str, references: dict, config: dict) -> dict:
             elif fc.name == "bash":
                 cmd = fc.args.get("command", "")
                 log.info(f"    [BASH]\n{cmd}")
-                result = await asyncio.to_thread(execute_bash, cmd)
+                result = await asyncio.to_thread(execute_bash, cmd, cwd=_odir)
                 log.info(f"    [BASH OUT] ({len(result)} chars)\n{result}")
             elif fc.name == "search":
                 query = fc.args.get("query", "")

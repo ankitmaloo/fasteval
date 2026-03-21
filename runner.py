@@ -122,12 +122,22 @@ class Runner:
     def peak_in_flight_tools(self) -> int:
         return self._tracker.peak_in_flight_tools
 
+    @property
+    def current_in_flight_evals(self) -> int:
+        return self._tracker.in_flight_evals
+
+    @property
+    def current_in_flight_tools(self) -> int:
+        return self._tracker.in_flight_tools
+
     async def run_cases(
         self,
         cases: Sequence[EvalCase],
         *,
         out_path: str | Path | None = None,
         on_case_complete: Callable[[CaseResult], Awaitable[None] | None] | None = None,
+        on_case_start: Callable[[EvalCase, float], Awaitable[None] | None] | None = None,
+        on_case_finish: Callable[[EvalCase, float], Awaitable[None] | None] | None = None,
     ) -> list[CaseResult]:
         indexed_cases = list(enumerate(cases))
         if not indexed_cases:
@@ -150,6 +160,8 @@ class Runner:
                         pool,
                         run_started,
                         on_case_complete=on_case_complete,
+                        on_case_start=on_case_start,
+                        on_case_finish=on_case_finish,
                     )
                 )
                 for _ in range(worker_count)
@@ -174,6 +186,8 @@ class Runner:
         pool: ProcessPoolExecutor,
         run_started: float,
         on_case_complete: Callable[[CaseResult], Awaitable[None] | None] | None,
+        on_case_start: Callable[[EvalCase, float], Awaitable[None] | None] | None,
+        on_case_finish: Callable[[EvalCase, float], Awaitable[None] | None] | None,
     ) -> None:
         while True:
             item = await queue.get()
@@ -182,7 +196,13 @@ class Runner:
                 break
             idx, case = item
             try:
-                result = await self._run_case(case, pool=pool, run_started=run_started)
+                result = await self._run_case(
+                    case,
+                    pool=pool,
+                    run_started=run_started,
+                    on_case_start=on_case_start,
+                    on_case_finish=on_case_finish,
+                )
                 results[idx] = result
                 if on_case_complete is not None:
                     callback_result = on_case_complete(result)
@@ -197,10 +217,16 @@ class Runner:
         *,
         pool: ProcessPoolExecutor,
         run_started: float,
+        on_case_start: Callable[[EvalCase, float], Awaitable[None] | None] | None,
+        on_case_finish: Callable[[EvalCase, float], Awaitable[None] | None] | None,
     ) -> CaseResult:
         async with self._eval_sem:
             await self._tracker.eval_enter()
             case_started = time.perf_counter()
+            if on_case_start is not None:
+                callback_result = on_case_start(case, case_started)
+                if inspect.isawaitable(callback_result):
+                    await callback_result
             started_at = case_started - run_started
 
             model_wait_s = 0.0
@@ -271,6 +297,10 @@ class Runner:
                 error = f"{type(exc).__name__}: {exc}"
             finally:
                 finished_at_raw = time.perf_counter()
+                if on_case_finish is not None:
+                    callback_result = on_case_finish(case, finished_at_raw)
+                    if inspect.isawaitable(callback_result):
+                        await callback_result
                 finished_at = finished_at_raw - run_started
                 total_s = finished_at_raw - case_started
                 self.case_timings[case.case_id] = (started_at, finished_at)

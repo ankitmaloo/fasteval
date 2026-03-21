@@ -8,13 +8,19 @@ wandb_project: null
 weave_project: null
 
 # Active provider (pass --provider on CLI to switch)
-provider: kimi
+provider: kimi-wandb
 
 # Provider configs — add new providers here
 # llm: path to the LLM module
 # Remaining keys are provider-specific (base_url/api_key/model for oaichat)
 providers:
   # --- OpenAI-compatible (oaichat) ---
+  kimi-wandb:
+    llm: eval/llms/oaichat.py
+    base_url: https://api.inference.wandb.ai/v1
+    api_key: ${WANDB_API_KEY}
+    model: moonshotai/Kimi-K2.5
+
   kimi:
     llm: eval/llms/oaichat.py
     base_url: https://api.moonshot.ai/v1
@@ -39,12 +45,129 @@ providers:
     api_key: ${MISTRAL_API_KEY}
     model: mistral-large-latest
 
+  glm5:
+    llm: eval/llms/oaichat.py
+    base_url: https://api.tokenfactory.us-central1.nebius.com/v1/
+    api_key: ${NEBIUS_API_KEY}
+    model: zai-org/GLM-5
+
+  deepseek-v3:
+    llm: eval/llms/oaichat.py
+    base_url: https://api.tokenfactory.us-central1.nebius.com/v1/
+    api_key: ${NEBIUS_API_KEY}
+    model: deepseek-ai/DeepSeek-V3.2
+
+  gpt-oss-120b:
+    llm: eval/llms/oaichat.py
+    base_url: https://api.tokenfactory.nebius.com/v1/
+    api_key: ${NEBIUS_API_KEY}
+    model: openai/gpt-oss-120b
+
+  gpt-oss-120b-fast:
+    llm: eval/llms/oaichat.py
+    base_url: https://api.tokenfactory.nebius.com/v1/
+    api_key: ${NEBIUS_API_KEY}
+    model: openai/gpt-oss-120b-fast
+
+  kimi-nebius:
+    llm: eval/llms/oaichat.py
+    base_url: https://api.tokenfactory.us-central1.nebius.com/v1/
+    api_key: ${NEBIUS_API_KEY}
+    model: moonshotai/Kimi-K2.5
+
+  nemotron:
+    llm: eval/llms/oaichat.py
+    base_url: https://api.tokenfactory.us-central1.nebius.com/v1/
+    api_key: ${NEBIUS_API_KEY}
+    model: nvidia/nemotron-3-super-120b-a12b
+
+  nemotron-or:
+    llm: eval/llms/oaichat.py
+    base_url: https://openrouter.ai/api/v1
+    api_key: ${GLM_API_KEY_OR}
+    model: nvidia/nemotron-3-super-120b-a12b
+    extra_body:
+      reasoning:
+        enabled: true
+
+  intellect-3:
+    llm: eval/llms/oaichat.py
+    base_url: https://api.tokenfactory.nebius.com/v1/
+    api_key: ${NEBIUS_API_KEY}
+    model: PrimeIntellect/INTELLECT-3
+
+  nemotron-nvidia:
+    llm: eval/llms/oaichat.py
+    base_url: https://integrate.api.nvidia.com/v1
+    api_key: ${NVIDIA_API_KEY}
+    model: nvidia/nemotron-3-super-120b-a12b
+    extra_body:
+      chat_template_kwargs:
+        enable_thinking: true
+      reasoning_budget: 16384
+
+  hunter-alpha:
+    llm: eval/llms/oaichat.py
+    base_url: https://openrouter.ai/api/v1
+    api_key: ${GLM_API_KEY_OR}
+    model: openrouter/hunter-alpha
+    extra_body:
+      reasoning:
+        enabled: true
+
+  deepseek-v3.2-fast:
+    llm: eval/llms/oaichat.py
+    base_url: https://api.tokenfactory.nebius.com/v1/
+    api_key: ${NEBIUS_API_KEY}
+    model: deepseek-ai/DeepSeek-V3.2-fast
+
+  healer-alpha:
+    llm: eval/llms/oaichat.py
+    base_url: https://openrouter.ai/api/v1
+    api_key: ${GLM_API_KEY_OR}
+    model: openrouter/healer-alpha
+
+  glm5-turbo:
+    llm: eval/llms/oaichat.py
+    base_url: https://openrouter.ai/api/v1
+    api_key: ${GLM_API_KEY_OR}
+    model: z-ai/glm-5-turbo
+    extra_body:
+      reasoning:
+        enabled: true
+
+  qwen-plus:
+    llm: eval/llms/oaichat.py
+    base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+    api_key: ${ALIBABA_KEY}
+    model: qwen-plus
+
+  minimax-m2.5:
+    llm: eval/llms/oaichat.py
+    base_url: https://api.tokenfactory.us-central1.nebius.com/v1/
+    api_key: ${NEBIUS_API_KEY}
+    model: MiniMaxAI/MiniMax-M2.5
+
+  minimax-m2.7:
+    llm: eval/llms/oaichat.py
+    base_url: https://openrouter.ai/api/v1
+    api_key: ${GLM_API_KEY_OR}
+    model: minimax/minimax-m2.7
+    extra_body:
+      reasoning:
+        enabled: true
+
   # --- Native providers ---
   gemini:
     llm: eval/llms/gemini.py
 
   openai:
     llm: eval/llms/openai.py
+
+  openai-xhigh:
+    llm: eval/llms/openai.py
+    model: gpt-5.4
+    reasoning_effort: xhigh
 
   claude:
     llm: eval/llms/claude.py

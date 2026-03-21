@@ -1,8 +1,9 @@
-"""Subject LLM: GPT-5.2 with code execution + search via Responses API."""
+"""Subject LLM: GPT-5.4 with code execution + search via Responses API."""
 
 import json
 import os
 import asyncio
+
 from openai import OpenAI, AsyncOpenAI
 from dotenv import load_dotenv
 
@@ -11,10 +12,12 @@ from eval.log import log
 
 load_dotenv()
 
-LLM_ID = "gpt-5.2"
+LLM_ID = os.environ.get("OPENAI_MODEL", "gpt-5.4")
+_reasoning_effort = os.environ.get("OPENAI_REASONING_EFFORT", "medium")
 
-_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-_async_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+_timeout = float(os.environ.get("OPENAI_TIMEOUT", "6000"))  # ~100 min default for xhigh
+_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"), timeout=_timeout, max_retries=0)
+_async_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"), timeout=_timeout, max_retries=0)
 
 _code_tool = {"type": "function", **CODE_SCHEMA}
 _bash_tool = {"type": "function", **BASH_SCHEMA}
@@ -59,6 +62,13 @@ def _build_tools(config: dict) -> list[dict]:
     return tools
 
 
+def _append_conv(config: dict, entry: dict) -> None:
+    store = config.get("_conv_store")
+    tid = config.get("_task_id", "")
+    if store and tid:
+        store.append(tid, entry)
+
+
 def _payload(final_text: str, turns: list[dict], usage_total: dict[str, int]) -> dict:
     return {
         "text": final_text,
@@ -73,21 +83,33 @@ def _payload(final_text: str, turns: list[dict], usage_total: dict[str, int]) ->
 
 def generate(task: str, references: dict, config: dict) -> dict:
     from eval.core import build_prompt
-    import os
     _odir = config.get("_output_dir")
-    _tid = config.get("_task_id")
-    _ofile = os.path.join(_odir, _tid) if _odir and _tid else _odir
-    prompt = build_prompt(task, references, output_file=_ofile)
+    prompt = build_prompt(
+        task,
+        references,
+        output_file=_odir,
+        extra_instructions=config.get("_prompt_repl_note"),
+    )
     task_repl = config.get("_repl")
     tools = _build_tools(config)
+
 
     input_items = [{"role": "user", "content": prompt}]
     usage_total = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     turns = []
     final_text = ""
 
+    # Log initial prompt
+    _append_conv(config, {"turn": 0, "role": "system", "content": SYSTEM_PROMPT})
+    _append_conv(config, {"turn": 0, "role": "user", "content": prompt})
+
     for turn in range(MAX_TURNS):
-        kwargs = {"model": LLM_ID, "input": input_items, "instructions": SYSTEM_PROMPT, "reasoning": {"effort": "medium"}}
+        kwargs = {
+            "model": LLM_ID,
+            "input": input_items,
+            "instructions": SYSTEM_PROMPT,
+            "reasoning": {"effort": _reasoning_effort},
+        }
         if tools:
             kwargs["tools"] = tools
         resp = _client.responses.create(**kwargs)
@@ -116,10 +138,16 @@ def generate(task: str, references: dict, config: dict) -> dict:
             final_text = resp.output_text or ""
             turn_info["content"] = final_text
             turns.append(turn_info)
+            _append_conv(config, {"turn": turn + 1, "role": "assistant", "content": final_text, "reasoning": reasoning})
             break
 
-        turns.append(turn_info)
+        # Log assistant tool calls
+        tc_log = []
+        for fc in fn_calls:
+            tc_log.append({"name": fc.name, "arguments": fc.arguments, "call_id": fc.call_id})
+        _append_conv(config, {"turn": turn + 1, "role": "assistant", "tool_calls": tc_log, "reasoning": reasoning})
 
+        turns.append(turn_info)
         input_items.extend(resp.output)
 
         for fc in fn_calls:
@@ -132,7 +160,7 @@ def generate(task: str, references: dict, config: dict) -> dict:
             elif fc.name == "bash":
                 cmd = args.get("command", "")
                 log.info(f"    [BASH]\n{cmd}")
-                result = execute_bash(cmd)
+                result = execute_bash(cmd, cwd=_odir)
                 log.info(f"    [BASH OUT] ({len(result)} chars)\n{result}")
             else:
                 result = f"[Unknown tool: {fc.name}]"
@@ -141,30 +169,43 @@ def generate(task: str, references: dict, config: dict) -> dict:
                 "call_id": fc.call_id,
                 "output": result,
             })
+            _append_conv(config, {"turn": turn + 1, "role": "tool", "name": fc.name, "call_id": fc.call_id, "result": result})
 
     if not final_text:
         final_text = resp.output_text or ""
+        _append_conv(config, {"turn": MAX_TURNS, "role": "assistant", "content": final_text, "exhausted": True})
 
     return _payload(final_text, turns, usage_total)
 
 
 async def generate_async(task: str, references: dict, config: dict) -> dict:
     from eval.core import build_prompt
-    import os
     _odir = config.get("_output_dir")
-    _tid = config.get("_task_id")
-    _ofile = os.path.join(_odir, _tid) if _odir and _tid else _odir
-    prompt = build_prompt(task, references, output_file=_ofile)
+    prompt = build_prompt(
+        task,
+        references,
+        output_file=_odir,
+        extra_instructions=config.get("_prompt_repl_note"),
+    )
     task_repl = config.get("_repl")
     tools = _build_tools(config)
+
 
     input_items = [{"role": "user", "content": prompt}]
     usage_total = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     turns = []
     final_text = ""
 
+    _append_conv(config, {"turn": 0, "role": "system", "content": SYSTEM_PROMPT})
+    _append_conv(config, {"turn": 0, "role": "user", "content": prompt})
+
     for turn in range(MAX_TURNS):
-        kwargs = {"model": LLM_ID, "input": input_items, "instructions": SYSTEM_PROMPT, "reasoning": {"effort": "medium"}}
+        kwargs = {
+            "model": LLM_ID,
+            "input": input_items,
+            "instructions": SYSTEM_PROMPT,
+            "reasoning": {"effort": _reasoning_effort},
+        }
         if tools:
             kwargs["tools"] = tools
         resp = await _async_client.responses.create(**kwargs)
@@ -193,7 +234,13 @@ async def generate_async(task: str, references: dict, config: dict) -> dict:
             final_text = resp.output_text or ""
             turn_info["content"] = final_text
             turns.append(turn_info)
+            _append_conv(config, {"turn": turn + 1, "role": "assistant", "content": final_text, "reasoning": reasoning})
             break
+
+        tc_log = []
+        for fc in fn_calls:
+            tc_log.append({"name": fc.name, "arguments": fc.arguments, "call_id": fc.call_id})
+        _append_conv(config, {"turn": turn + 1, "role": "assistant", "tool_calls": tc_log, "reasoning": reasoning})
 
         turns.append(turn_info)
         input_items.extend(resp.output)
@@ -208,7 +255,7 @@ async def generate_async(task: str, references: dict, config: dict) -> dict:
             elif fc.name == "bash":
                 cmd = args.get("command", "")
                 log.info(f"    [BASH]\n{cmd}")
-                result = await asyncio.to_thread(execute_bash, cmd)
+                result = await asyncio.to_thread(execute_bash, cmd, cwd=_odir)
                 log.info(f"    [BASH OUT] ({len(result)} chars)\n{result}")
             else:
                 result = f"[Unknown tool: {fc.name}]"
@@ -217,7 +264,10 @@ async def generate_async(task: str, references: dict, config: dict) -> dict:
                 "call_id": fc.call_id,
                 "output": result,
             })
+            _append_conv(config, {"turn": turn + 1, "role": "tool", "name": fc.name, "call_id": fc.call_id, "result": result})
 
     if not final_text:
         final_text = resp.output_text or ""
+        _append_conv(config, {"turn": MAX_TURNS, "role": "assistant", "content": final_text, "exhausted": True})
+
     return _payload(final_text, turns, usage_total)

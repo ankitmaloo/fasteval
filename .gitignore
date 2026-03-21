@@ -9,6 +9,10 @@ dist/
 *.egg-info/
 .eggs/
 
+*artifacts/
+*/eval/artifacts
+eval/artifacts/
+
 # Virtual environments
 .venv/
 venv/
@@ -37,6 +41,9 @@ htmlcov/
 eval/results/*.jsonl
 eval/results/*.meta.json
 eval/results/*.log
+
+# Conversation logs (can be very large)
+*.conv.jsonl
 
 .sync_tmp/
 

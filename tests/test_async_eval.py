@@ -54,6 +54,71 @@ def test_async_eval_fake_client_writes_results_and_meta(tmp_path: Path) -> None:
     assert meta_payload["peak_in_flight_tools"] <= 4
     assert meta_payload["peak_in_flight_evals"] <= 16
     assert meta_payload["ok"] + meta_payload["failed"] == 30
+    assert meta_payload["heartbeat_at"]
+    assert meta_payload["last_progress_at"]
+    assert meta_payload["current_in_flight_evals"] == 0
+    assert meta_payload["current_in_flight_tools"] == 0
+    assert meta_payload["current_in_flight_judges"] == 0
+    assert meta_payload["oldest_in_flight_eval_case_id"] is None
+    assert meta_payload["oldest_in_flight_eval_age_s"] is None
+
+
+def test_async_eval_writes_heartbeat_metadata_while_running(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    dataset = tmp_path / "dataset.jsonl"
+    output = tmp_path / "results.jsonl"
+    meta = output.with_suffix(".meta.json")
+    _write_dataset(dataset, 6)
+
+    monkeypatch.setattr(async_eval_mod, "HEARTBEAT_INTERVAL_S", 0.02)
+
+    config = AsyncRunConfig(
+        client="fake",
+        eval_sem=2,
+        cpu_sem=1,
+        fake_base_latency_s=0.12,
+        fake_jitter_s=0.0,
+        fake_tool_ratio=0.0,
+        case_max_steps=1,
+    )
+
+    errors: list[Exception] = []
+
+    def _run() -> None:
+        try:
+            run_async_eval(config, dataset_path=dataset, output_path=output)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+
+    observed_running: dict[str, Any] | None = None
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        if meta.exists():
+            payload = json.loads(meta.read_text(encoding="utf-8"))
+            if payload.get("status") == "running" and payload.get("current_in_flight_evals", 0) > 0:
+                observed_running = payload
+                break
+        time.sleep(0.02)
+
+    worker.join(timeout=10.0)
+    assert not worker.is_alive()
+    assert not errors
+    assert observed_running is not None
+    assert observed_running["heartbeat_at"]
+    assert observed_running["last_progress_at"]
+    assert observed_running["current_in_flight_evals"] > 0
+    assert observed_running["oldest_in_flight_eval_case_id"] is not None
+    assert observed_running["oldest_in_flight_eval_age_s"] is not None
+
+    final_meta = json.loads(meta.read_text(encoding="utf-8"))
+    assert final_meta["status"] == "completed"
+    assert final_meta["current_in_flight_evals"] == 0
+    assert final_meta["current_in_flight_tools"] == 0
+    assert final_meta["current_in_flight_judges"] == 0
 
 
 def test_async_eval_resume_skips_already_completed_ids(tmp_path: Path) -> None:
@@ -239,6 +304,7 @@ def test_async_eval_judge_pipeline_runs_in_parallel_and_is_capped(
         *,
         criterion_workers: int,
         rubric: dict[str, list[Any]] | None = None,
+        conv_store: Any = None,
     ) -> dict[str, Any]:
         assert criterion_workers == 2
         assert llm_answer
@@ -303,6 +369,7 @@ def test_async_eval_judge_skips_cases_without_rubric(
         *,
         criterion_workers: int,
         rubric: dict[str, list[Any]] | None = None,
+        conv_store: Any = None,
     ) -> dict[str, Any]:
         calls["count"] += 1
         assert task["id"] == "kw_002"

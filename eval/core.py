@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import csv
+import re
 import shutil
 import time
 import threading
@@ -12,7 +13,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from google import genai
 from google.genai import types
@@ -44,22 +45,27 @@ RESULTS_DIR = EVAL_DIR / "results"
 JUDGE_PROMPT = """You are a strict evaluator. You will be given:
 - A TASK that was given to an AI agent
 - The agent's ANSWER
+- An ARTIFACT CONTEXT block describing the task artifact directory, discovered files, and preloaded objects
 - A single CRITERION to evaluate
 
-The ANSWER already contains all text output files the agent produced, including the full contents of any Excel workbooks (with formulas where cached values were unavailable).
-
-You have a Python REPL tool with pre-loaded Excel workbooks (if any). Use `print(_preloaded_files)` to see what's available. Pre-loaded variables:
+You have a Python REPL tool with the task artifact directory as its working directory when one exists.
+Use `print(artifact_root)`, `print(artifact_manifest)`, and `print(_preloaded_files)` to see what was discovered and preloaded.
+Common pre-loaded variables:
+- `artifact_root`: absolute artifact directory for this task
+- `artifact_manifest`: list of discovered artifact metadata
+- `artifacts_text`: parsed text artifacts keyed by relative path
+- `artifacts_tables`: parsed table artifacts keyed by relative path
 - `<filename>_data`: openpyxl Workbook opened with data_only=True (cached computed values)
 - `<filename>_formulas`: openpyxl Workbook opened with data_only=False (raw formulas)
-Example: `ws = Enzara_ENZ401_Valuation_Model_data['rNPV']` then `ws.cell(row, col).value`.
-If cached values are None, check the _formulas workbook and evaluate the formula logic yourself.
+Example: `ws = model_i_headlamp_vendor_npv_analysis_data['Sheet1']` or `print(artifacts_text['report.md'])`.
 
 Use the REPL for:
-- Inspecting pre-loaded workbook cells and sheets
+- Inspecting pre-loaded artifact objects
+- Inspecting workbook cells and sheets
 - Validating numerical calculations or formulas
 - Counting words or characters precisely
 
-Do NOT use the REPL to search the filesystem or open files not already pre-loaded.
+Prefer the ARTIFACT CONTEXT block and preloaded variables over rediscovering file paths.
 
 Respond with exactly one word: PASS or FAIL
 
@@ -113,6 +119,19 @@ def _parse_xlsx(path: Path) -> str:
     return "\n\n".join(parts)
 
 
+def _parse_docx_tables(path: Path) -> list[list[list[str]]]:
+    from docx import Document
+
+    doc = Document(str(path))
+    tables: list[list[list[str]]] = []
+    for table in doc.tables:
+        rows: list[list[str]] = []
+        for row in table.rows:
+            rows.append([cell.text.strip() for cell in row.cells])
+        tables.append(rows)
+    return tables
+
+
 def read_reference_files(ref_paths: list[str] | None) -> dict:
     """Process reference files. Returns {inline: {name: content}, paths: {name: abs_path}}.
     Text/csv/md → inlined. Docx → parsed and inlined. Excel/binary → abs path for REPL."""
@@ -163,33 +182,130 @@ JUDGE_MAX_TURNS = 25
 
 
 def _preload_output_files(output_dir: str | None, task_id: str | None = None) -> dict:
-    """Pre-load Excel/data files from output_dir into a dict for REPL seeding.
-    Returns a dict of variables to inject into each judge REPL."""
+    """Backwards-compatible wrapper for judge REPL seeding."""
+    return build_judge_artifact_bundle(output_dir, task_id=task_id)["repl_seed"]
+
+
+def _artifact_var_base(rel_path: str) -> str:
+    base = rel_path.lower()
+    if "." in base:
+        base = str(Path(base).with_suffix(""))
+    return re.sub(r"[^a-z0-9]+", "_", base).strip("_") or "artifact"
+
+
+def _format_manifest_entry(entry: dict[str, Any]) -> str:
+    ext = entry.get("extension") or "[no ext]"
+    preload = entry.get("preloaded")
+    preload_text = ""
+    if isinstance(preload, list) and preload:
+        preload_text = "; preloaded: " + ", ".join(f"`{name}`" for name in preload)
+    return (
+        f"- {entry['relative_path']} ({ext}, {entry['size_bytes']} bytes"
+        f"{preload_text})"
+    )
+
+
+def build_judge_artifact_bundle(output_dir: str | None, task_id: str | None = None) -> dict[str, Any]:
+    """Build the deterministic artifact bundle consumed by judge prompt + REPL."""
     if not output_dir:
-        return {}
+        return {
+            "artifact_root": None,
+            "manifest": [],
+            "prompt_context": "No artifact directory was configured for this task.",
+            "repl_seed": {},
+        }
+
     import openpyxl
-    d = _resolve_output_dir(output_dir, task_id=task_id)
-    if not d.is_dir():
-        return {}
-    seed = {}
-    files_loaded = {}
-    for f in sorted(d.iterdir()):
-        if not f.is_file():
-            continue
-        ext = f.suffix.lower()
-        if ext in (".xlsx", ".xls"):
+
+    artifact_dir = _resolve_output_dir(output_dir, task_id=task_id)
+    artifact_root = str(artifact_dir.resolve())
+    manifest: list[dict[str, Any]] = []
+    repl_seed: dict[str, Any] = {
+        "artifact_root": artifact_root,
+        "artifact_manifest": manifest,
+    }
+    artifacts_text: dict[str, str] = {}
+    artifacts_tables: dict[str, Any] = {}
+    preloaded_files: dict[str, list[str]] = {}
+    inline_sections: list[str] = []
+
+    for path in _iter_output_files(artifact_dir):
+        rel_path = path.relative_to(artifact_dir).as_posix()
+        ext = path.suffix.lower()
+        entry: dict[str, Any] = {
+            "relative_path": rel_path,
+            "absolute_path": str(path.resolve()),
+            "extension": ext,
+            "size_bytes": path.stat().st_size,
+            "preloaded": [],
+        }
+        var_base = _artifact_var_base(rel_path)
+
+        if ext in _INLINE_EXTS:
             try:
-                wb_data = openpyxl.load_workbook(str(f), data_only=True)
-                wb_formulas = openpyxl.load_workbook(str(f), data_only=False)
-                var_name = f.stem.replace(" ", "_").replace("-", "_")
-                seed[f"{var_name}_data"] = wb_data
-                seed[f"{var_name}_formulas"] = wb_formulas
-                files_loaded[f.name] = var_name
-            except Exception as e:
-                log.warning(f"  [PRELOAD] failed to load {f.name}: {e}")
-    if files_loaded:
-        seed["_preloaded_files"] = files_loaded
-    return seed
+                content = path.read_text(encoding="utf-8")
+            except Exception as exc:
+                content = f"[READ ERROR: {exc}]"
+            artifacts_text[rel_path] = content
+            repl_seed[f"{var_base}_text"] = content
+            entry["preloaded"].append(f"{var_base}_text")
+            inline_sections.append(f"--- {rel_path} ---\n{content}")
+        elif ext == ".docx":
+            try:
+                content = _parse_docx(path)
+                tables = _parse_docx_tables(path)
+            except Exception as exc:
+                content = f"[DOCX PARSE ERROR: {exc}]"
+                tables = []
+            artifacts_text[rel_path] = content
+            artifacts_tables[rel_path] = tables
+            repl_seed[f"{var_base}_text"] = content
+            repl_seed[f"{var_base}_tables"] = tables
+            entry["preloaded"].extend([f"{var_base}_text", f"{var_base}_tables"])
+            inline_sections.append(f"--- {rel_path} ---\n{content}")
+        elif ext in (".xlsx", ".xls"):
+            try:
+                wb_data = openpyxl.load_workbook(str(path), data_only=True)
+                wb_formulas = openpyxl.load_workbook(str(path), data_only=False)
+                repl_seed[f"{var_base}_data"] = wb_data
+                repl_seed[f"{var_base}_formulas"] = wb_formulas
+                entry["preloaded"].extend([f"{var_base}_data", f"{var_base}_formulas"])
+            except Exception as exc:
+                log.warning(f"  [PRELOAD] failed to load {rel_path}: {exc}")
+
+        if entry["preloaded"]:
+            preloaded_files[rel_path] = list(entry["preloaded"])
+        manifest.append(entry)
+
+    if artifacts_text:
+        repl_seed["artifacts_text"] = artifacts_text
+    if artifacts_tables:
+        repl_seed["artifacts_tables"] = artifacts_tables
+    if preloaded_files:
+        repl_seed["_preloaded_files"] = preloaded_files
+
+    prompt_parts = [f"Artifact root: `{artifact_root}`"]
+    if manifest:
+        prompt_parts.append("Artifact manifest:")
+        prompt_parts.extend(_format_manifest_entry(entry) for entry in manifest)
+    else:
+        prompt_parts.append("Artifact manifest: no files were produced.")
+    if preloaded_files:
+        prompt_parts.append("Preloaded artifact objects:")
+        for rel_path, names in preloaded_files.items():
+            prompt_parts.append(
+                f"- {rel_path}: " + ", ".join(f"`{name}`" for name in names)
+            )
+    if inline_sections:
+        prompt_parts.append("--- ARTIFACT FILE CONTENTS ---")
+        prompt_parts.append("\n\n".join(inline_sections))
+
+    return {
+        "artifact_root": artifact_root,
+        "manifest": manifest,
+        "prompt_context": "\n".join(prompt_parts),
+        "repl_seed": repl_seed,
+    }
 
 
 @_weave_op
@@ -219,18 +335,39 @@ def _gemini_call_with_retry(client, model, contents, config, tag: str, max_retri
 
 @_weave_op
 def judge_criterion(task: str, answer: str, criterion: str, tier: str = "", idx: int = 0,
-                    repl_seed: dict | None = None) -> bool:
+                    repl_seed: dict | None = None,
+                    output_dir: str | None = None,
+                    artifact_context: str | None = None,
+                    conv_store: Any = None, task_id: str = "") -> bool:
     """Judge a single criterion with its own REPL instance. Returns True for PASS."""
     tag = f"[JUDGE {tier}#{idx}]"
     log.info(f"  {tag} evaluating: {criterion}")
-    judge_repl = PythonREPL(seed_globals=repl_seed)
-    prompt = f"TASK:\n{task}\n\nANSWER:\n{answer}\n\nCRITERION:\n{criterion}"
+    judge_repl = PythonREPL(seed_globals=repl_seed, output_dir=output_dir)
+    prompt = (
+        f"TASK:\n{task}\n\n"
+        f"ANSWER:\n{answer}\n\n"
+        f"ARTIFACT CONTEXT:\n{artifact_context or 'No artifact context available.'}\n\n"
+        f"CRITERION:\n{criterion}"
+    )
     contents = [types.Content(role="user", parts=[types.Part(text=prompt)])]
     config = types.GenerateContentConfig(
         system_instruction=JUDGE_PROMPT,
         thinking_config=types.ThinkingConfig(thinking_level="LOW"),
         tools=_judge_tools,
     )
+
+    def _jconv(entry: dict) -> None:
+        if conv_store and task_id:
+            conv_store.append_judge(task_id, entry)
+
+    _jconv({
+        "turn": 0,
+        "role": "judge_start",
+        "tier": tier,
+        "idx": idx,
+        "criterion": criterion,
+        "artifact_context": artifact_context,
+    })
 
     try:
         for turn in range(JUDGE_MAX_TURNS):
@@ -243,7 +380,13 @@ def judge_criterion(task: str, answer: str, criterion: str, tier: str = "", idx:
                 verdict = (resp.text or "").strip().upper()
                 passed = verdict.startswith("PASS")
                 log.info(f"  {tag} -> {'PASS' if passed else 'FAIL'} (turns={turn + 1}, {usage.prompt_token_count}in/{usage.candidates_token_count}out)")
-                return passed
+                _jconv({
+                    "turn": turn + 1, "role": "judge_verdict", "tier": tier, "idx": idx,
+                    "criterion": criterion, "verdict": "PASS" if passed else "FAIL",
+                    "response": resp.text or "",
+                    "usage": {"input_tokens": usage.prompt_token_count, "output_tokens": usage.candidates_token_count},
+                })
+                return (passed, None)
 
             contents.append(candidate.content)
             fn_parts = []
@@ -256,16 +399,26 @@ def judge_criterion(task: str, answer: str, criterion: str, tier: str = "", idx:
                     log.info(f"  {tag} code out: {result}")
                 else:
                     result = f"[Unknown tool: {fc.name}]"
+                _jconv({
+                    "turn": turn + 1, "role": "judge_tool", "tier": tier, "idx": idx,
+                    "criterion": criterion, "tool": fc.name,
+                    "code": fc.args.get("code", "") if fc.name == "execute_code" else None,
+                    "result": result,
+                })
                 fn_parts.append(types.Part(function_response=types.FunctionResponse(
                     name=fc.name, response={"output": result},
                 )))
             contents.append(types.Content(role="user", parts=fn_parts))
 
         log.info(f"  {tag} -> exhausted {JUDGE_MAX_TURNS} turns, defaulting to verdict from last response")
-        return (resp.text or "").strip().upper().startswith("PASS")
+        _jconv({"turn": JUDGE_MAX_TURNS, "role": "judge_verdict", "tier": tier, "idx": idx,
+                "criterion": criterion, "verdict": "FAIL", "exhausted": True})
+        return (False, None)  # (passed, error)
     except Exception as e:
         log.error(f"  {tag} FATAL: {e}")
-        return False
+        _jconv({"turn": -1, "role": "judge_error", "tier": tier, "idx": idx,
+                "criterion": criterion, "error": str(e)})
+        return (False, str(e))
 
 
 @_weave_op
@@ -275,6 +428,10 @@ def judge_rubric(
     rubric: dict,
     criterion_workers: int | None = None,
     repl_seed: dict | None = None,
+    output_dir: str | None = None,
+    artifact_context: str | None = None,
+    conv_store: Any = None,
+    task_id: str = "",
 ) -> dict:
     """Judge all rubric criteria in parallel. Returns eval dict."""
     mandatory = rubric.get("mandatory", [])
@@ -288,6 +445,7 @@ def judge_rubric(
     )
 
     results = {"mandatory": [None] * len(mandatory), "good_to_have": [None] * len(good_to_have), "ideal": [None] * len(ideal)}
+    errors = []
     if not all_criteria:
         return results
 
@@ -297,12 +455,20 @@ def judge_rubric(
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(judge_criterion, task, answer, criterion, tier, idx, repl_seed): (tier, idx)
+            executor.submit(judge_criterion, task, answer, criterion, tier, idx, repl_seed, output_dir, artifact_context,
+                            conv_store=conv_store, task_id=task_id): (tier, idx)
             for tier, idx, criterion in all_criteria
         }
         for future in as_completed(futures):
             tier, idx = futures[future]
-            results[tier][idx] = future.result()
+            passed, error = future.result()
+            results[tier][idx] = passed
+            if error:
+                errors.append({"tier": tier, "idx": idx, "error": error})
+
+    if errors:
+        results["judge_errors"] = errors
+        log.warning(f"  [JUDGE] {len(errors)} criterion(s) failed with errors")
 
     return results
 
@@ -318,12 +484,19 @@ def score_rubric(mandatory: list[bool], good_to_have: list[bool], ideal: list[bo
     return round(score, 4)
 
 
-def build_prompt(task_text: str, references: dict, output_file: str | None = None) -> str:
+def build_prompt(
+    task_text: str,
+    references: dict,
+    output_file: str | None = None,
+    extra_instructions: str | None = None,
+) -> str:
     """Build the full prompt string from task + references.
     references = {inline: {name: content}, paths: {name: abs_path}}"""
     parts = [task_text]
     inline = references.get("inline", {})
     file_paths = references.get("paths", {})
+    if extra_instructions:
+        parts.append(f"\n\n{extra_instructions}")
     if inline:
         parts.append("\n\n--- REFERENCE DOCUMENTS ---")
         for name, content in inline.items():
@@ -333,7 +506,9 @@ def build_prompt(task_text: str, references: dict, output_file: str | None = Non
         for name, abspath in file_paths.items():
             parts.append(f"- {name}: {abspath}")
     if output_file:
-        parts.append(f"\n\nSave your output to: `{output_file}`")
+        parts.append(
+            f"\n\nSave all output files only inside this path: `{output_file}`"
+        )
     return "\n".join(parts)
 
 
@@ -377,9 +552,20 @@ def _clear_output_dir(d: Path):
     """Remove all files in the output directory before a task run."""
     if not d.is_dir():
         return
-    for f in d.iterdir():
-        if f.is_file():
-            f.unlink()
+    for child in d.iterdir():
+        if child.is_dir():
+            shutil.rmtree(child)
+        elif child.is_file():
+            child.unlink()
+
+
+def _iter_output_files(d: Path) -> list[Path]:
+    if not d.is_dir():
+        return []
+    return sorted(
+        (path for path in d.rglob("*") if path.is_file()),
+        key=lambda path: path.relative_to(d).as_posix(),
+    )
 
 
 def _collect_output_files(d: Path) -> dict:
@@ -389,9 +575,8 @@ def _collect_output_files(d: Path) -> dict:
         return {"inline": "", "paths": []}
     inline_parts = []
     data_paths = []
-    for f in sorted(d.iterdir()):
-        if not f.is_file():
-            continue
+    for f in _iter_output_files(d):
+        rel_path = f.relative_to(d).as_posix()
         ext = f.suffix.lower()
         if ext in _INLINE_EXTS or ext == ".docx":
             try:
@@ -399,7 +584,7 @@ def _collect_output_files(d: Path) -> dict:
                     content = _parse_docx(f)
                 else:
                     content = f.read_text(encoding="utf-8")
-                inline_parts.append(f"--- {f.name} ---\n{content}")
+                inline_parts.append(f"--- {rel_path} ---\n{content}")
             except Exception:
                 continue
         else:
@@ -494,14 +679,11 @@ def _run_task(
         answer = raw_answer
         llm_metadata = None
 
-    # Collect output files for judging
-    judged_answer = answer
-    if task_out_dir:
-        output = _collect_output_files(task_out_dir)
-        if output["inline"]:
-            judged_answer = f"{answer}\n\n--- OUTPUT FILES ---\n{output['inline']}"
-        if output["paths"]:
-            judged_answer += "\n\n--- DATA FILES (use REPL to read with pandas) ---\n" + "\n".join(f"- {p}" for p in output["paths"])
+    artifact_bundle = build_judge_artifact_bundle(output_dir_name) if task_out_dir else {
+        "artifact_root": None,
+        "prompt_context": None,
+        "repl_seed": {},
+    }
 
     answer_len = len(answer)
     cost_info = f", ${llm_metadata['cost_usd']:.4f}" if llm_metadata and 'cost_usd' in llm_metadata else ""
@@ -515,9 +697,12 @@ def _run_task(
     log.info(f"  [{tid}] [JUDGING] {n_m + n_g + n_i} criteria (mandatory={n_m}, good_to_have={n_g}, ideal={n_i})")
     eval_results = judge_rubric(
         task["task"],
-        judged_answer,
+        answer,
         task["rubric"],
         criterion_workers=criterion_workers,
+        repl_seed=artifact_bundle["repl_seed"] or None,
+        output_dir=artifact_bundle["artifact_root"],
+        artifact_context=artifact_bundle["prompt_context"],
     )
     task_score = score_rubric(eval_results["mandatory"], eval_results["good_to_have"], eval_results["ideal"])
 

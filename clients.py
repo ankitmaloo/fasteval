@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -137,19 +138,48 @@ class ProviderLLMClient(LLMClient):
         *,
         generate_fn: Callable[[str, dict[str, Any], dict[str, Any]], Any]
         | Callable[[str, dict[str, Any], dict[str, Any]], Awaitable[Any]],
-        case_contexts: Mapping[str, ProviderCaseContext],
+        case_contexts: Mapping[str, ProviderCaseContext] | None = None,
+        case_context_factory: Callable[[str], ProviderCaseContext] | None = None,
     ) -> None:
+        if case_contexts is None and case_context_factory is None:
+            raise ValueError("ProviderLLMClient requires case_contexts or case_context_factory")
         self._generate_fn = generate_fn
         self._generate_is_async = inspect.iscoroutinefunction(generate_fn)
-        self._case_contexts = dict(case_contexts)
+        self._case_contexts = dict(case_contexts or {})
+        self._case_context_factory = case_context_factory
+        self._case_lock = threading.Lock()
         self._case_metadata: dict[str, dict[str, Any] | None] = {}
         self._case_latencies_s: dict[str, float] = {}
 
     def get_case_metadata(self, case_id: str) -> dict[str, Any] | None:
         return self._case_metadata.get(case_id)
 
+    def pop_case_metadata(self, case_id: str) -> dict[str, Any] | None:
+        return self._case_metadata.pop(case_id, None)
+
     def get_case_latency_s(self, case_id: str) -> float | None:
         return self._case_latencies_s.get(case_id)
+
+    def release_case(self, case_id: str) -> None:
+        with self._case_lock:
+            self._case_contexts.pop(case_id, None)
+        self._case_metadata.pop(case_id, None)
+        self._case_latencies_s.pop(case_id, None)
+
+    def _get_case_context(self, case_id: str) -> ProviderCaseContext | None:
+        with self._case_lock:
+            context = self._case_contexts.get(case_id)
+            if context is not None:
+                return context
+        if self._case_context_factory is None:
+            return None
+        context = self._case_context_factory(case_id)
+        with self._case_lock:
+            existing = self._case_contexts.get(case_id)
+            if existing is not None:
+                return existing
+            self._case_contexts[case_id] = context
+            return context
 
     @staticmethod
     def _is_transient_provider_error(exc: Exception) -> bool:
@@ -192,7 +222,7 @@ class ProviderLLMClient(LLMClient):
 
     async def complete(self, messages: Sequence[Message]) -> Response:
         case_id, _step = _extract_case_and_step(messages)
-        context = self._case_contexts.get(case_id)
+        context = self._get_case_context(case_id)
         if context is None:
             raise KeyError(f"Missing provider context for case_id={case_id!r}")
 

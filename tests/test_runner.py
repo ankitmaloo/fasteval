@@ -202,3 +202,43 @@ def test_provider_rate_limit_retries_same_task() -> None:
     assert results[0].status == "ok"
     assert results[0].output_text == "ok::run"
     assert attempts["count"] == 3
+
+
+def test_provider_client_builds_context_lazily_and_can_release_state() -> None:
+    built: list[str] = []
+
+    def build_context(case_id: str) -> ProviderCaseContext:
+        built.append(case_id)
+        return ProviderCaseContext(
+            task_text=f"task::{case_id}",
+            references={"case_id": case_id},
+            config={},
+        )
+
+    def generate(
+        task: str, references: dict[str, Any], config: dict[str, Any]
+    ) -> dict[str, Any]:
+        assert config == {}
+        return {
+            "text": f"{task}::{references['case_id']}",
+            "metadata": {"case_id": references["case_id"]},
+        }
+
+    client = ProviderLLMClient(
+        generate_fn=generate,
+        case_context_factory=build_context,
+    )
+
+    assert built == []
+    results = asyncio.run(
+        Runner(llm_client=client, eval_sem=1, cpu_sem=1).run_cases(
+            [EvalCase(case_id="lazy-case", prompt="ignored", max_steps=1)]
+        )
+    )
+
+    assert [result.output_text for result in results] == ["task::lazy-case::lazy-case"]
+    assert built == ["lazy-case"]
+    assert client.get_case_metadata("lazy-case") == {"case_id": "lazy-case"}
+
+    client.release_case("lazy-case")
+    assert client.get_case_metadata("lazy-case") is None

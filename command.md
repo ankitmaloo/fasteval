@@ -39,3 +39,10 @@ JSON
 curl -X POST http://localhost:8000/eval/start \
   -H 'Content-Type: application/json' \
   --data @/tmp/eval_start_full.json
+
+ source .venv/bin/activate && source .env && uvicorn service.api:app --host       
+   0.0.0.0 --port 8000  
+
+
+set -a && source .env && set +a && source .venv/bin/activate && uvicorn      
+      service.api:app --host 0.0.0.0 --port 8000
