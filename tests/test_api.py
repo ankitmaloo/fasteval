@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -50,3 +51,34 @@ def test_start_rejects_when_live_run_exists(monkeypatch) -> None:
     finally:
         api_mod._active = original_active
         api_mod._last_meta_path = original_last_meta_path
+
+
+def test_get_run_prefers_scoring_for_summary(tmp_path: Path, monkeypatch) -> None:
+    results_dir = tmp_path / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+    run_path = results_dir / "demo.jsonl"
+    meta_path = results_dir / "demo.meta.json"
+
+    run_path.write_text(
+        "\n".join(
+            [
+                json.dumps({"id": "a", "status": "ok", "scoring": {"score": 1.0}, "metrics": {"total_s": 2.0}}),
+                json.dumps({"id": "b", "status": "ok", "eval": {"score": 0.25}, "metrics": {"total_s": 4.0}}),
+                json.dumps({"id": "c", "status": "error"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    meta_path.write_text(json.dumps({"status": "completed"}), encoding="utf-8")
+
+    monkeypatch.setattr(api_mod, "RESULTS_DIR", results_dir)
+    monkeypatch.setattr(api_mod, "_get_storage", lambda: None)
+
+    payload = api_mod.get_run("demo")
+
+    assert payload["count"] == 3
+    assert payload["ok_count"] == 2
+    assert payload["failed_count"] == 1
+    assert payload["avg_score"] == 0.625
+    assert payload["avg_total_s"] == 3.0

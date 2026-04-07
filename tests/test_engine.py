@@ -795,6 +795,40 @@ class TestPythonREPL:
         assert "reports/final.txt" in collected["inline"]
         assert "nested hello" in collected["inline"]
 
+    def test_working_dir_can_differ_from_artifact_dir(self, tmp_path: Path) -> None:
+        from eval.tools import PythonREPL
+
+        artifact_dir = tmp_path / "artifact"
+        workspace_dir = tmp_path / "workspace"
+        r = PythonREPL(
+            output_dir=str(artifact_dir),
+            working_dir=str(workspace_dir),
+            write_redirect_dir=None,
+        )
+        out = r.run("from pathlib import Path\nPath('note.txt').write_text('hello'); print('done')")
+
+        assert "done" in out
+        assert (workspace_dir / "note.txt").read_text() == "hello"
+        assert not (artifact_dir / "note.txt").exists()
+
+    def test_strict_write_mode_rejects_writes_outside_cwd(self, tmp_path: Path) -> None:
+        from eval.tools import PythonREPL
+
+        workspace_dir = tmp_path / "workspace"
+        other_dir = tmp_path / "other"
+        other_dir.mkdir()
+        r = PythonREPL(
+            working_dir=str(workspace_dir),
+            write_redirect_dir=str(workspace_dir),
+            write_mode="strict",
+        )
+        out = r.run(
+            f"from pathlib import Path\nPath({str(other_dir / 'escape.txt')!r}).write_text('nope')\n",
+        )
+
+        assert "PermissionError" in out
+        assert not (other_dir / "escape.txt").exists()
+
 
 # ---------------------------------------------------------------------------
 # Tool concurrency tracking (eval/tools.py)
@@ -917,6 +951,238 @@ class TestProviderClientConstruction:
         assert "quotes_tables" in seed
         assert "Do not try to reopen the original reference files from disk." in ctx.config["_prompt_repl_note"]
         assert "`quotes_tables`" in ctx.config["_prompt_repl_note"]
+
+    def test_provider_case_context_daytona_rewrites_paths_and_output_dir(self, tmp_path: Path, monkeypatch: Any) -> None:
+        import service.engine as engine_mod
+        import eval.core as core_mod
+
+        refs_dir = tmp_path / "reference_files"
+        refs_dir.mkdir()
+        csv_path = refs_dir / "data.csv"
+        csv_path.write_text("a,b\n1,2\n", encoding="utf-8")
+
+        monkeypatch.setattr(engine_mod, "BASE_DIR", tmp_path)
+        monkeypatch.setattr(core_mod, "BASE_DIR", tmp_path)
+        monkeypatch.setattr(
+            engine_mod,
+            "_prepare_task_output_dir",
+            lambda task: str(tmp_path / "artifact" / str(task.get("id", ""))),
+        )
+
+        ctx = engine_mod._provider_case_context(
+            {
+                "id": "case daytona",
+                "task": "analyze",
+                "reference_files": ["data.csv"],
+                "config": {"repl_mode": "daytona", "sandbox_template": "snap-123"},
+            }
+        )
+
+        assert ctx.config["_output_dir"] == ".kwbench/tasks/case-daytona/output"
+        assert ctx.config["_local_output_dir"] == str(tmp_path / "artifact" / "case daytona")
+        assert ctx.config["_bash_cwd"] == ".kwbench/tasks/case-daytona/output"
+        assert ctx.config["_python_cwd"] == ".kwbench/tasks/case-daytona/output"
+        assert ctx.references["paths"]["data.csv"] == ".kwbench/tasks/case-daytona/refs/data.csv"
+        assert "Daytona sandbox" in ctx.config["_prompt_repl_note"]
+        assert "case daytona" in ctx.config["_prompt_repl_note"]
+        assert ctx.config["_runtime_type"] == "daytona"
+        assert ctx.config["_tool_runtime"] is not None
+        assert ctx.config["_tool_session"] is ctx.config["_repl"]
+        assert type(ctx.config["_repl"]).__name__ == "DaytonaPythonREPL"
+
+    def test_provider_case_context_terminal_bench_uses_workspace_contract(
+        self,
+        tmp_path: Path,
+        monkeypatch: Any,
+    ) -> None:
+        import service.engine as engine_mod
+        from eval.benchmarks.terminal_bench import TerminalBenchPlugin
+
+        monkeypatch.setattr(
+            engine_mod,
+            "_prepare_task_output_dir",
+            lambda task: str(tmp_path / "artifact" / str(task.get("id", ""))),
+        )
+
+        ctx = engine_mod._provider_case_context(
+            {
+                "id": "tb-001",
+                "task": "fix the terminal task",
+                "work_dir": "/app",
+                "config": {"runtime_type": "daytona"},
+            },
+            benchmark_plugin=TerminalBenchPlugin(),
+        )
+
+        assert ctx.config["_output_dir"] is None
+        assert ctx.config["_local_output_dir"] == str(tmp_path / "artifact" / "tb-001")
+        assert ctx.config["_bash_cwd"] == "/app"
+        assert ctx.config["_python_cwd"] == "/app"
+        assert ctx.config["_write_redirect_dir"] is None
+        assert ctx.config["_write_mode"] is None
+        assert ctx.config["_remote_workspace_root"] == "/app"
+        assert ctx.config["_remote_write_redirect_dir"] == "/app"
+        assert ctx.config["_remote_write_mode"] == "strict"
+        assert ctx.config["_remote_sync_dir"] is None
+        assert "sandbox workspace `/app`" in ctx.config["_prompt_repl_note"]
+        assert "Do not relocate benchmark outputs into the harness artifact directory." in ctx.config["_prompt_repl_note"]
+
+    def test_provider_case_context_applies_benchmark_plugin_overrides(self) -> None:
+        import service.engine as engine_mod
+
+        class TestPlugin:
+            def build_case_context(self, case: dict[str, Any]) -> dict[str, Any] | None:
+                return {"custom_refs": {"id": case["id"]}}
+
+            def build_prompt(self, case: dict[str, Any], context: dict[str, Any] | None) -> str | None:
+                return f"PLUGIN::{case['id']}"
+
+            def allowed_tools(self, case: dict[str, Any]) -> list[str] | None:
+                return ["bash"]
+
+        ctx = engine_mod._provider_case_context(
+            {
+                "id": "case-plugin",
+                "task": "original task",
+                "config": {"enable_code": True, "enable_bash": False, "enable_search": True},
+            },
+            benchmark_plugin=TestPlugin(),
+        )
+
+        assert ctx.task_text == "PLUGIN::case-plugin"
+        assert ctx.references == {"custom_refs": {"id": "case-plugin"}}
+        assert ctx.config["enable_code"] is False
+        assert ctx.config["enable_bash"] is True
+        assert ctx.config["enable_search"] is False
+
+    def test_tool_limit_prefers_sandbox_concurrency_for_daytona(self) -> None:
+        import service.engine as engine_mod
+
+        cfg = engine_mod.AsyncRunConfig(repl_mode="daytona", sandbox_concurrency=17, cpu_sem=2)
+        assert engine_mod._tool_limit(cfg) == 17
+
+        local_cfg = engine_mod.AsyncRunConfig(repl_mode="local", cpu_sem=3)
+        assert engine_mod._tool_limit(local_cfg) == 3
+
+    def test_resolve_runtime_config_reads_sandbox_defaults_from_yaml(self, tmp_path: Path) -> None:
+        import service.engine as engine_mod
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            textwrap.dedent(
+                """
+                sandbox:
+                  mode: daytona
+                  template: snap-default
+                  concurrency: 11
+                providers:
+                  demo:
+                    llm: eval/llms/openai.py
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        resolved = engine_mod._resolve_runtime_config(
+            engine_mod.AsyncRunConfig(
+                client="provider",
+                provider="demo",
+                provider_config_path=str(config_path),
+            )
+        )
+
+        assert resolved.repl_mode == "daytona"
+        assert resolved.runtime_type == "daytona"
+        assert resolved.sandbox_template == "snap-default"
+        assert resolved.sandbox_concurrency == 11
+
+    def test_resolve_runtime_config_reads_runtime_defaults_from_yaml(self, tmp_path: Path) -> None:
+        import service.engine as engine_mod
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            textwrap.dedent(
+                """
+                runtime:
+                  type: daytona
+                  template: runtime-snap
+                  concurrency: 9
+                providers:
+                  demo:
+                    llm: eval/llms/openai.py
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        resolved = engine_mod._resolve_runtime_config(
+            engine_mod.AsyncRunConfig(
+                client="provider",
+                provider="demo",
+                provider_config_path=str(config_path),
+            )
+        )
+
+        assert resolved.runtime_type == "daytona"
+        assert resolved.repl_mode == "daytona"
+        assert resolved.sandbox_template == "runtime-snap"
+        assert resolved.sandbox_concurrency == 9
+
+    def test_resolve_runtime_config_reads_judge_provider_from_yaml(self, tmp_path: Path) -> None:
+        import service.engine as engine_mod
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            textwrap.dedent(
+                """
+                judge:
+                  provider: openai-xhigh
+                providers:
+                  openai-xhigh:
+                    llm: eval/llms/openai.py
+                    model: gpt-5.4
+                    reasoning_effort: xhigh
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        resolved = engine_mod._resolve_runtime_config(
+            engine_mod.AsyncRunConfig(
+                client="provider",
+                provider="openai-xhigh",
+                provider_config_path=str(config_path),
+            )
+        )
+
+        assert resolved.judge_provider == "openai-xhigh"
+
+    def test_resolve_runtime_config_reads_judge_provider_for_fake_client(self, tmp_path: Path) -> None:
+        import service.engine as engine_mod
+
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            textwrap.dedent(
+                """
+                judge:
+                  provider: gemini
+                """
+            ).strip()
+            + "\n",
+            encoding="utf-8",
+        )
+
+        resolved = engine_mod._resolve_runtime_config(
+            engine_mod.AsyncRunConfig(
+                client="fake",
+                provider_config_path=str(config_path),
+            )
+        )
+
+        assert resolved.judge_provider == "gemini"
 
     def test_build_client_defers_provider_context_creation(self, monkeypatch: Any) -> None:
         import service.engine as engine_mod
@@ -1156,6 +1422,10 @@ class TestRunAsyncEvalE2E:
         with patch("service.engine._judge_task_with_rubric", return_value=mock_eval) as mock_fn:
             out = run_async_eval(config, dataset_path=ds, output_path=tmp_path / "out.jsonl")
 
+        _, kwargs = mock_fn.call_args
+        assert kwargs["judge_provider"] is None
+        assert kwargs["repl_mode"] == "local"
+
         rows = [json.loads(line) for line in out.read_text().splitlines()]
         assert len(rows) == 2
 
@@ -1218,6 +1488,13 @@ class TestApiValidation:
 
         with pytest.raises(HTTPException):
             _validate_request(self._make_req(cpu_sem=0))
+
+    def test_sandbox_concurrency_zero_rejected(self) -> None:
+        from service.api import _validate_request
+        from fastapi import HTTPException
+
+        with pytest.raises(HTTPException):
+            _validate_request(self._make_req(sandbox_concurrency=0))
 
     def test_negative_max_retries_rejected(self) -> None:
         from service.api import _validate_request

@@ -138,7 +138,7 @@ Integration tests for the full async eval pipeline.
 | `test_async_eval_preserves_original_task_row_and_appends_runner_fields` | Custom fields from dataset preserved in output alongside runner fields |
 | `test_async_eval_judge_pipeline_runs_in_parallel_and_is_capped` | 12 tasks with rubric — judge runs concurrently, peak capped at `judge_sem=3` |
 | `test_async_eval_judge_skips_cases_without_rubric` | Only rubric tasks judged, others pass through without `eval` |
-| `test_async_eval_judge_requires_gemini_key` | ValueError raised when `judge_enabled=True` without `GEMINI_API_KEY` |
+| `test_async_eval_judge_no_longer_requires_gemini_key` | Async judge can run without forcing Gemini-specific env validation when judging is mocked |
 | `test_async_eval_uploads_results_to_hf_dataset` | Mocked HF upload called with correct args, meta records upload status |
 
 ## test_async_provider.py (2 tests)

@@ -13,7 +13,15 @@ from dotenv import load_dotenv
 
 from exa_py import Exa
 
-from eval.tools import CODE_SCHEMA, BASH_SCHEMA, execute_code, execute_bash, MAX_TURNS, SYSTEM_PROMPT
+from eval.tools import (
+    CODE_SCHEMA,
+    BASH_SCHEMA,
+    execute_code,
+    execute_bash,
+    MAX_TURNS,
+    SYSTEM_PROMPT,
+    max_turns_for_config,
+)
 from eval.log import log
 
 load_dotenv()
@@ -150,11 +158,12 @@ def _final_payload(text: str, model: str, usage_total: dict, turns: list[dict], 
 
 def generate(task: str, references: dict, config: dict) -> dict:
     from eval.core import build_prompt
-    _odir = config.get("_output_dir")
+    _prompt_output = config.get("_output_dir")
+    _bash_cwd = config.get("_bash_cwd") or _prompt_output
     prompt = build_prompt(
         task,
         references,
-        output_file=_odir,
+        output_file=_prompt_output,
         extra_instructions=config.get("_prompt_repl_note"),
     )
     task_repl = config.get("_repl")
@@ -166,12 +175,14 @@ def generate(task: str, references: dict, config: dict) -> dict:
 
     usage_total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     turns = []
+    max_turns = max_turns_for_config(config)
 
     _append_conv(config, {"turn": 0, "role": "system", "content": SYSTEM_PROMPT})
     _append_conv(config, {"turn": 0, "role": "user", "content": prompt})
 
-    for turn_idx in range(MAX_TURNS):
-        log.info(f"    [oaichat] turn {turn_idx}")
+    _tid = config.get("_task_id", "")
+    for turn_idx in range(max_turns):
+        log.info(f"    [oaichat] [{_tid}] turn {turn_idx}")
         kwargs = {"model": _model, "messages": messages}
         if tools:
             kwargs["tools"] = tools
@@ -196,7 +207,7 @@ def generate(task: str, references: dict, config: dict) -> dict:
 
         tool_calls = msg.get("tool_calls")
         if not tool_calls:
-            log.info(f" -> done (finish={choice.get('finish_reason')})")
+            log.info(f" -> [{_tid}] done (finish={choice.get('finish_reason')})")
             turn_data["content"] = msg.get("content") or ""
             turns.append(turn_data)
             _append_conv(config, {"turn": turn_idx, "role": "assistant", "content": msg.get("content") or "", "thinking": thinking})
@@ -231,7 +242,7 @@ def generate(task: str, references: dict, config: dict) -> dict:
             elif name == "execute_code":
                 result = execute_code(args.get("code", ""), repl_instance=task_repl)
             elif name == "bash":
-                result = execute_bash(args.get("command", ""), cwd=_odir)
+                result = execute_bash(args.get("command", ""), cwd=_bash_cwd, repl_instance=task_repl)
             elif name == "search":
                 result = _exa_search(args.get("query", ""))
             else:
@@ -245,19 +256,20 @@ def generate(task: str, references: dict, config: dict) -> dict:
 
     # Exhausted turns
     last_content = (msg.get("content") or "") if msg else ""
-    _append_conv(config, {"turn": MAX_TURNS, "role": "assistant", "content": last_content, "exhausted": True})
-    result = _final_payload(last_content, raw.get("model", _model), usage_total, turns, MAX_TURNS - 1)
+    _append_conv(config, {"turn": max_turns, "role": "assistant", "content": last_content, "exhausted": True})
+    result = _final_payload(last_content, raw.get("model", _model), usage_total, turns, max_turns - 1)
     result["metadata"]["exhausted"] = True
     return result
 
 
 async def generate_async(task: str, references: dict, config: dict) -> dict:
     from eval.core import build_prompt
-    _odir = config.get("_output_dir")
+    _prompt_output = config.get("_output_dir")
+    _bash_cwd = config.get("_bash_cwd") or _prompt_output
     prompt = build_prompt(
         task,
         references,
-        output_file=_odir,
+        output_file=_prompt_output,
         extra_instructions=config.get("_prompt_repl_note"),
     )
     task_repl = config.get("_repl")
@@ -267,12 +279,14 @@ async def generate_async(task: str, references: dict, config: dict) -> dict:
 
     usage_total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     turns = []
+    max_turns = max_turns_for_config(config)
 
     _append_conv(config, {"turn": 0, "role": "system", "content": SYSTEM_PROMPT})
     _append_conv(config, {"turn": 0, "role": "user", "content": prompt})
 
-    for turn_idx in range(MAX_TURNS):
-        log.info(f"    [oaichat] turn {turn_idx}")
+    _tid = config.get("_task_id", "")
+    for turn_idx in range(max_turns):
+        log.info(f"    [oaichat] [{_tid}] turn {turn_idx}")
         kwargs = {"model": _model, "messages": messages}
         if tools:
             kwargs["tools"] = tools
@@ -297,7 +311,7 @@ async def generate_async(task: str, references: dict, config: dict) -> dict:
 
         tool_calls = msg.get("tool_calls")
         if not tool_calls:
-            log.info(f" -> done (finish={choice.get('finish_reason')})")
+            log.info(f" -> [{_tid}] done (finish={choice.get('finish_reason')})")
             turn_data["content"] = msg.get("content") or ""
             turns.append(turn_data)
             _append_conv(config, {"turn": turn_idx, "role": "assistant", "content": msg.get("content") or "", "thinking": thinking})
@@ -331,7 +345,7 @@ async def generate_async(task: str, references: dict, config: dict) -> dict:
                     execute_code, args.get("code", ""), repl_instance=task_repl
                 )
             elif name == "bash":
-                result = await asyncio.to_thread(execute_bash, args.get("command", ""), cwd=_odir)
+                result = await asyncio.to_thread(execute_bash, args.get("command", ""), cwd=_bash_cwd, repl_instance=task_repl)
             elif name == "search":
                 result = await asyncio.to_thread(_exa_search, args.get("query", ""))
             else:
@@ -344,8 +358,8 @@ async def generate_async(task: str, references: dict, config: dict) -> dict:
         turns.append(turn_data)
 
     last_content = (msg.get("content") or "") if msg else ""
-    _append_conv(config, {"turn": MAX_TURNS, "role": "assistant", "content": last_content, "exhausted": True})
-    result = _final_payload(last_content, raw.get("model", _model), usage_total, turns, MAX_TURNS - 1)
+    _append_conv(config, {"turn": max_turns, "role": "assistant", "content": last_content, "exhausted": True})
+    result = _final_payload(last_content, raw.get("model", _model), usage_total, turns, max_turns - 1)
     result["metadata"]["exhausted"] = True
     return result
 

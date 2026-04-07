@@ -6,12 +6,20 @@ from google import genai
 from google.genai import types
 from dotenv import load_dotenv
 
-from eval.tools import CODE_SCHEMA, BASH_SCHEMA, execute_code, execute_bash, MAX_TURNS, SYSTEM_PROMPT
+from eval.tools import (
+    CODE_SCHEMA,
+    BASH_SCHEMA,
+    execute_code,
+    execute_bash,
+    MAX_TURNS,
+    SYSTEM_PROMPT,
+    max_turns_for_config,
+)
 from eval.log import log
 
 load_dotenv()
 
-LLM_ID = "gemini-3-flash-preview"
+LLM_ID = os.environ.get("GEMINI_MODEL", "gemini-3-flash-preview")
 
 _client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
@@ -67,11 +75,11 @@ def _build_tools(config: dict) -> list[types.Tool]:
     return [types.Tool(function_declarations=decls)] if decls else []
 
 
-def _response_payload(text: str, usage_total: dict[str, int], turns: list[dict]) -> dict:
+def _response_payload(text: str, model: str, usage_total: dict[str, int], turns: list[dict]) -> dict:
     return {
         "text": text,
         "metadata": {
-            "model": LLM_ID,
+            "model": model,
             "usage": usage_total,
             "turns": turns,
             "total_turns": len(turns),
@@ -105,28 +113,32 @@ async def _search_subagent_async(query: str) -> str:
 
 def generate(task: str, references: dict, config: dict) -> dict:
     from eval.core import build_prompt
-    _odir = config.get("_output_dir")
+    _prompt_output = config.get("_output_dir")
+    _bash_cwd = config.get("_bash_cwd") or _prompt_output
+    _model = config.get("model") or LLM_ID
     prompt = build_prompt(
         task,
         references,
-        output_file=_odir,
+        output_file=_prompt_output,
         extra_instructions=config.get("_prompt_repl_note"),
     )
     task_repl = config.get("_repl")
     tools = _build_tools(config)
+    max_turns = max_turns_for_config(config)
 
     contents = [types.Content(role="user", parts=[types.Part(text=prompt)])]
     usage_total = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     turns: list[dict] = []
+    _tid = config.get("_task_id", "")
 
-    for turn in range(MAX_TURNS):
+    for turn in range(max_turns):
         cfg = types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
+            system_instruction=SYSTEM_PROMPT + "\nYour search tool is a subagent. You can ask for multiple things in one turn.",
             thinking_config=types.ThinkingConfig(thinking_level="MEDIUM"),
         )
         if tools:
             cfg.tools = tools
-        resp = _client.models.generate_content(model=LLM_ID, contents=contents, config=cfg)
+        resp = _client.models.generate_content(model=_model, contents=contents, config=cfg)
         candidate = resp.candidates[0]
         usage = resp.usage_metadata
         usage_counts = _usage_counts(usage)
@@ -134,11 +146,12 @@ def generate(task: str, references: dict, config: dict) -> dict:
         usage_total["output_tokens"] += usage_counts["output_tokens"]
         usage_total["total_tokens"] += usage_counts["total_tokens"]
         turns.append({"turn": turn + 1, "usage": usage_counts})
-        log.info(f"    [GEMINI] turn {turn + 1}/{MAX_TURNS} {usage.prompt_token_count}in/{usage.candidates_token_count}out")
+        log.info(f"    [GEMINI] [{_tid}] turn {turn + 1}/{max_turns} {usage.prompt_token_count}in/{usage.candidates_token_count}out")
 
-        fn_calls = [p for p in candidate.content.parts if p.function_call]
+        parts = candidate.content.parts or []
+        fn_calls = [p for p in parts if p.function_call]
         if not fn_calls:
-            return _response_payload(resp.text or "", usage_total, turns)
+            return _response_payload(resp.text or "", _model, usage_total, turns)
 
         contents.append(candidate.content)
 
@@ -153,7 +166,7 @@ def generate(task: str, references: dict, config: dict) -> dict:
             elif fc.name == "bash":
                 cmd = fc.args.get("command", "")
                 log.info(f"    [BASH]\n{cmd}")
-                result = execute_bash(cmd, cwd=_odir)
+                result = execute_bash(cmd, cwd=_bash_cwd, repl_instance=task_repl)
                 log.info(f"    [BASH OUT] ({len(result)} chars)\n{result}")
             elif fc.name == "search":
                 query = fc.args.get("query", "")
@@ -167,34 +180,38 @@ def generate(task: str, references: dict, config: dict) -> dict:
             )))
         contents.append(types.Content(role="user", parts=fn_parts))
 
-    return _response_payload(resp.text or "", usage_total, turns)
+    return _response_payload(resp.text or "", _model, usage_total, turns)
 
 
 async def generate_async(task: str, references: dict, config: dict) -> dict:
     from eval.core import build_prompt
-    _odir = config.get("_output_dir")
+    _prompt_output = config.get("_output_dir")
+    _bash_cwd = config.get("_bash_cwd") or _prompt_output
+    _model = config.get("model") or LLM_ID
     prompt = build_prompt(
         task,
         references,
-        output_file=_odir,
+        output_file=_prompt_output,
         extra_instructions=config.get("_prompt_repl_note"),
     )
     task_repl = config.get("_repl")
     tools = _build_tools(config)
+    max_turns = max_turns_for_config(config)
 
     contents = [types.Content(role="user", parts=[types.Part(text=prompt)])]
     usage_total = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     turns: list[dict] = []
+    _tid = config.get("_task_id", "")
 
-    for turn in range(MAX_TURNS):
+    for turn in range(max_turns):
         cfg = types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
+            system_instruction=SYSTEM_PROMPT + "\nYour search tool is a subagent. You can ask for multiple things in one turn.",
             thinking_config=types.ThinkingConfig(thinking_level="MEDIUM"),
         )
         if tools:
             cfg.tools = tools
         resp = await _client.aio.models.generate_content(
-            model=LLM_ID,
+            model=_model,
             contents=contents,
             config=cfg,
         )
@@ -205,11 +222,12 @@ async def generate_async(task: str, references: dict, config: dict) -> dict:
         usage_total["output_tokens"] += usage_counts["output_tokens"]
         usage_total["total_tokens"] += usage_counts["total_tokens"]
         turns.append({"turn": turn + 1, "usage": usage_counts})
-        log.info(f"    [GEMINI] turn {turn + 1}/{MAX_TURNS} {usage.prompt_token_count}in/{usage.candidates_token_count}out")
+        log.info(f"    [GEMINI] [{_tid}] turn {turn + 1}/{max_turns} {usage.prompt_token_count}in/{usage.candidates_token_count}out")
 
-        fn_calls = [p for p in candidate.content.parts if p.function_call]
+        parts = candidate.content.parts or []
+        fn_calls = [p for p in parts if p.function_call]
         if not fn_calls:
-            return _response_payload(resp.text or "", usage_total, turns)
+            return _response_payload(resp.text or "", _model, usage_total, turns)
 
         contents.append(candidate.content)
 
@@ -224,7 +242,7 @@ async def generate_async(task: str, references: dict, config: dict) -> dict:
             elif fc.name == "bash":
                 cmd = fc.args.get("command", "")
                 log.info(f"    [BASH]\n{cmd}")
-                result = await asyncio.to_thread(execute_bash, cmd, cwd=_odir)
+                result = await asyncio.to_thread(execute_bash, cmd, cwd=_bash_cwd, repl_instance=task_repl)
                 log.info(f"    [BASH OUT] ({len(result)} chars)\n{result}")
             elif fc.name == "search":
                 query = fc.args.get("query", "")
@@ -238,4 +256,4 @@ async def generate_async(task: str, references: dict, config: dict) -> dict:
             )))
         contents.append(types.Content(role="user", parts=fn_parts))
 
-    return _response_payload(resp.text or "", usage_total, turns)
+    return _response_payload(resp.text or "", _model, usage_total, turns)

@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import threading
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -47,11 +48,16 @@ class EvalRequest(BaseModel):
     dataset: str | None = None
     task_ids: list[str] | None = None
     output: str | None = None
+    benchmark: str | None = None
     wandb_project: str | None = os.environ.get("WANDB_PROJECT")
     weave_project: str | None = os.environ.get("WEAVE_PROJECT")
     client: Literal["fake", "replay", "provider"] = "fake"
     replay_fixtures: str | None = None
     provider_config_path: str | None = None
+    runtime_type: Literal["local", "daytona"] | None = None
+    repl_mode: Literal["local", "daytona"] = "local"
+    sandbox_template: str | None = None
+    sandbox_concurrency: int | None = None
     eval_sem: int = 64
     cpu_sem: int | None = None
     max_retries: int = 2
@@ -63,6 +69,7 @@ class EvalRequest(BaseModel):
     case_tool_payload: int | float | str = 0.02
     case_max_steps: int = 3
     judge_enabled: bool = False
+    judge_provider: str | None = None
     judge_sem: int = 4
     judge_criterion_workers: int = 4
     hf_results_upload: bool = _env_bool("HF_RESULTS_UPLOAD", False)
@@ -83,7 +90,14 @@ def _load_llm(name: str):
     return mod
 
 
-def _run_bg_legacy(llm_mod, dataset, output, task_ids, storage, wandb_project, weave_project):
+def _clear_active(run_token: str) -> None:
+    global _active
+    with _lock:
+        if _active and _active.get("token") == run_token:
+            _active = None
+
+
+def _run_bg_legacy(llm_mod, dataset, output, task_ids, storage, wandb_project, weave_project, run_token: str):
     global _active
     try:
         from eval.core import run_eval
@@ -101,8 +115,7 @@ def _run_bg_legacy(llm_mod, dataset, output, task_ids, storage, wandb_project, w
         payload["output"] = str(output)
         meta_path.write_text(json.dumps(payload))
     finally:
-        with _lock:
-            _active = None
+        _clear_active(run_token)
 
 
 def _run_bg_async(
@@ -111,6 +124,7 @@ def _run_bg_async(
     output: Path,
     task_ids: set[str] | None,
     storage: S3Storage | None,
+    run_token: str,
 ) -> None:
     global _active
     try:
@@ -128,8 +142,7 @@ def _run_bg_async(
         payload["output"] = str(output)
         meta_path.write_text(json.dumps(payload))
     finally:
-        with _lock:
-            _active = None
+        _clear_active(run_token)
 
 
 def _validate_request(req: EvalRequest) -> None:
@@ -137,6 +150,8 @@ def _validate_request(req: EvalRequest) -> None:
         raise HTTPException(400, "eval_sem must be >= 1")
     if req.cpu_sem is not None and req.cpu_sem < 1:
         raise HTTPException(400, "cpu_sem must be >= 1")
+    if req.sandbox_concurrency is not None and req.sandbox_concurrency < 1:
+        raise HTTPException(400, "sandbox_concurrency must be >= 1")
     if req.max_retries < 0:
         raise HTTPException(400, "max_retries must be >= 0")
     if req.case_max_steps < 1:
@@ -147,8 +162,6 @@ def _validate_request(req: EvalRequest) -> None:
         raise HTTPException(400, "judge_criterion_workers must be >= 1")
     if req.hf_results_upload and not req.hf_results_repo.strip():
         raise HTTPException(400, "hf_results_repo must be non-empty when hf_results_upload=true")
-    if req.engine == "async" and req.judge_enabled and not os.environ.get("GEMINI_API_KEY"):
-        raise HTTPException(400, "GEMINI_API_KEY is required when judge_enabled=True")
     if req.engine == "legacy" and not req.llm:
         raise HTTPException(400, "llm is required when engine='legacy'")
     if req.engine == "async" and req.client == "replay" and not req.replay_fixtures:
@@ -172,18 +185,25 @@ def _start(req: EvalRequest, out: Path) -> dict:
     global _active
     global _last_meta_path
     _validate_request(req)
-    with _lock:
-        if _active and _active["thread"].is_alive():
-            raise HTTPException(409, "Eval already running")
 
     dataset = Path(req.dataset) if req.dataset else None
     task_ids = set(req.task_ids) if req.task_ids else None
     storage = _get_storage()
     meta_path = out.with_suffix(".meta.json")
+    run_token = uuid.uuid4().hex
 
     if req.engine == "legacy":
         llm_mod = _load_llm(req.llm or "")
-        args = (llm_mod, dataset, out, task_ids, storage, req.wandb_project, req.weave_project)
+        args = (
+            llm_mod,
+            dataset,
+            out,
+            task_ids,
+            storage,
+            req.wandb_project,
+            req.weave_project,
+            run_token,
+        )
         t = threading.Thread(target=_run_bg_legacy, args=args, daemon=True)
     else:
         config = AsyncRunConfig(
@@ -191,6 +211,11 @@ def _start(req: EvalRequest, out: Path) -> dict:
             replay_fixtures=req.replay_fixtures,
             provider=req.llm,
             provider_config_path=req.provider_config_path,
+            benchmark=req.benchmark,
+            runtime_type=req.runtime_type,
+            repl_mode=req.repl_mode,
+            sandbox_template=req.sandbox_template,
+            sandbox_concurrency=req.sandbox_concurrency,
             eval_sem=req.eval_sem,
             cpu_sem=req.cpu_sem,
             max_retries=req.max_retries,
@@ -204,6 +229,7 @@ def _start(req: EvalRequest, out: Path) -> dict:
             wandb_project=req.wandb_project,
             weave_project=req.weave_project,
             judge_enabled=req.judge_enabled,
+            judge_provider=req.judge_provider,
             judge_sem=req.judge_sem,
             judge_criterion_workers=req.judge_criterion_workers,
             hf_results_upload=req.hf_results_upload,
@@ -213,13 +239,20 @@ def _start(req: EvalRequest, out: Path) -> dict:
             hf_fetch_if_missing=req.hf_fetch_if_missing,
             hf_force_refresh=req.hf_force_refresh,
         )
-        args = (config, dataset, out, task_ids, storage)
+        args = (config, dataset, out, task_ids, storage, run_token)
         t = threading.Thread(target=_run_bg_async, args=args, daemon=True)
 
     with _lock:
-        _active = {"thread": t, "meta_path": meta_path, "output": out}
+        if _active and _active["thread"].is_alive():
+            raise HTTPException(409, "Eval already running")
+        _active = {"thread": t, "meta_path": meta_path, "output": out, "token": run_token}
         _last_meta_path = meta_path
-    t.start()
+        try:
+            t.start()
+        except Exception:
+            if _active and _active.get("token") == run_token:
+                _active = None
+            raise
     return {
         "status": "started",
         "engine": req.engine,
@@ -318,8 +351,16 @@ def get_run(name: str):
         except json.JSONDecodeError:
             continue
 
-    scores = [r["eval"]["score"] for r in results if "eval" in r]
-    ok_count = sum(1 for r in results if r.get("status") == "ok" or "eval" in r)
+    scores = []
+    for row in results:
+        scoring = row.get("scoring")
+        if isinstance(scoring, dict) and isinstance(scoring.get("score"), (int, float)):
+            scores.append(float(scoring["score"]))
+            continue
+        eval_payload = row.get("eval")
+        if isinstance(eval_payload, dict) and isinstance(eval_payload.get("score"), (int, float)):
+            scores.append(float(eval_payload["score"]))
+    ok_count = sum(1 for r in results if r.get("status") == "ok" or "scoring" in r or "eval" in r)
     failed_count = sum(1 for r in results if r.get("status") == "error")
     async_durations = [
         r.get("metrics", {}).get("total_s")

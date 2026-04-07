@@ -10,7 +10,7 @@ import os
 import requests
 from dotenv import load_dotenv
 
-from eval.tools import BASH_SCHEMA, execute_bash, MAX_TURNS, SYSTEM_PROMPT
+from eval.tools import BASH_SCHEMA, execute_bash, MAX_TURNS, SYSTEM_PROMPT, max_turns_for_config
 
 load_dotenv()
 
@@ -31,8 +31,9 @@ def generate(task: str, references: dict[str, str], config: dict) -> str:
     prompt = "\n".join(parts)
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
+    max_turns = max_turns_for_config(config)
 
-    for _ in range(MAX_TURNS):
+    for _ in range(max_turns):
         resp = requests.post(_url, json={
             "model": _model,
             "messages": messages,

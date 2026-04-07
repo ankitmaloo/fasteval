@@ -160,9 +160,20 @@ class ProviderLLMClient(LLMClient):
     def get_case_latency_s(self, case_id: str) -> float | None:
         return self._case_latencies_s.get(case_id)
 
+    def get_case_context(self, case_id: str) -> ProviderCaseContext | None:
+        with self._case_lock:
+            return self._case_contexts.get(case_id)
+
     def release_case(self, case_id: str) -> None:
         with self._case_lock:
-            self._case_contexts.pop(case_id, None)
+            context = self._case_contexts.pop(case_id, None)
+        if context is not None:
+            repl = context.config.get("_repl")
+            if repl is not None and hasattr(repl, "close"):
+                try:
+                    repl.close()
+                except Exception:
+                    pass
         self._case_metadata.pop(case_id, None)
         self._case_latencies_s.pop(case_id, None)
 
@@ -225,6 +236,11 @@ class ProviderLLMClient(LLMClient):
         context = self._get_case_context(case_id)
         if context is None:
             raise KeyError(f"Missing provider context for case_id={case_id!r}")
+
+        prepare_fn = context.config.get("_prepare_case")
+        if callable(prepare_fn) and not context.config.get("_case_prepared"):
+            await prepare_fn()
+            context.config["_case_prepared"] = True
 
         started = time.perf_counter()
         try:

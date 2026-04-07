@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import json
 from pathlib import Path
+from typing import Any
 
 from service.engine import AsyncRunConfig, run_async_eval
 
@@ -113,6 +114,80 @@ def test_provider_prefers_generate_async_when_available(tmp_path: Path) -> None:
     assert len(rows) == 8
     assert all(row["llm_metadata"]["mode"] == "async" for row in rows)
     assert all(row["llm_answer"].startswith("ASYNC::") for row in rows)
+
+
+def test_provider_prepare_case_runs_before_generate_and_passes_turn_cap(tmp_path: Path) -> None:
+    from eval.benchmarks import register
+    from eval.benchmarks.base import BaseBenchmarkPlugin
+
+    dataset = tmp_path / "dataset.jsonl"
+    output = tmp_path / "results_prepare.jsonl"
+    llm_module = tmp_path / "demo_prepare_provider.py"
+    marker_src = tmp_path / "marker.txt"
+    marker_dst = tmp_path / "prepared" / "marker.txt"
+
+    marker_src.write_text("prepared", encoding="utf-8")
+    dataset.write_text(json.dumps({"id": "prep_001", "task": "prepared task"}) + "\n", encoding="utf-8")
+
+    llm_module.write_text(
+        "\n".join(
+            [
+                'LLM_ID = "demo-prepare-provider"',
+                "",
+                "from pathlib import Path",
+                "",
+                "def generate(task, references, config):",
+                "    marker = Path(config['marker_path'])",
+                "    return {",
+                "        'text': f'prepared={marker.exists()}',",
+                "        'metadata': {",
+                "            'prepared': marker.exists(),",
+                "            'max_turns': config.get('_max_turns'),",
+                "        },",
+                "    }",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    class PreparePlugin(BaseBenchmarkPlugin):
+        name = "prepare-plugin"
+
+        def load_cases(self, dataset_path: Path | None) -> list[dict[str, Any]]:
+            rows = [
+                json.loads(line)
+                for line in Path(dataset_path).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            for row in rows:
+                row["config"] = {"marker_path": str(marker_dst)}
+            return rows
+
+        async def prepare_case(self, case: dict[str, Any], repl: Any) -> None:
+            repl.upload_file(str(marker_src), str(marker_dst))
+
+    register("prepare-plugin", PreparePlugin)
+
+    cfg = AsyncRunConfig(
+        client="provider",
+        provider=str(llm_module),
+        benchmark="prepare-plugin",
+        eval_sem=2,
+        cpu_sem=1,
+        case_max_steps=2,
+    )
+    run_async_eval(cfg, dataset_path=dataset, output_path=output)
+
+    rows = [
+        json.loads(line)
+        for line in output.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(rows) == 1
+    assert rows[0]["llm_metadata"]["prepared"] is True
+    assert rows[0]["llm_metadata"]["max_turns"] == 2
+    assert rows[0]["llm_answer"] == "prepared=True"
 
 
 def test_claude_provider_exposes_async_entrypoint() -> None:

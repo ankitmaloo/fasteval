@@ -2,14 +2,14 @@ cat > /tmp/eval_start_full.json <<'JSON'
 {
   "engine": "async",
   "llm": "openai",
-  "dataset": "/Users/ankit/Documents/dev/RL/benchmarks/evals/dataset.jsonl",
+  "dataset": " dataset.jsonl",
   "task_ids": null,
-  "output": "/Users/ankit/Documents/dev/RL/benchmarks/evals/service/results/final-openai-benchmark.jsonl",
+  "output": " service/results/final-openai-benchmark.jsonl",
   "wandb_project": "kwb",
 
   "client": "provider",
   "replay_fixtures": null,
-  "provider_config_path": "/Users/ankit/Documents/dev/RL/benchmarks/evals/eval/config.yaml",
+  "provider_config_path": " eval/config.yaml",
 
   "eval_sem": 64,
   "cpu_sem": 8,

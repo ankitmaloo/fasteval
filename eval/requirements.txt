@@ -15,3 +15,5 @@ python-docx
 huggingface-hub
 PyYAML
 exa-py
+cloudpickle
+daytona

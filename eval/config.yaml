@@ -8,7 +8,38 @@ wandb_project: null
 weave_project: null
 
 # Active provider (pass --provider on CLI to switch)
-provider: kimi-wandb
+provider: gemini-3.1-pro
+
+# Remote sandbox execution defaults for provider tool calls.
+# `mode: daytona` enables remote Python/bash execution with local artifact sync.
+# `runtime:` is the preferred name; `sandbox:` remains supported for compatibility.
+runtime:
+  type: local
+  template: null
+  concurrency: null
+
+sandbox:
+  mode: local
+  template: null
+  concurrency: null
+
+# Judge model selection. `provider` should match an entry under `providers:`.
+# The judge uses the same REPL backend as the main eval path.
+judge:
+  provider: gemini
+
+# Benchmark plugins — add new benchmarks here
+# module: path to Python file, class: plugin class name
+benchmarks:
+  kwbench:
+    module: eval/benchmarks/kwbench.py
+    class: KWBenchPlugin
+  gsm8k:
+    module: eval/benchmarks/gsm8k.py
+    class: GSM8KPlugin
+  terminal_bench:
+    module: eval/benchmarks/terminal_bench.py
+    class: TerminalBenchPlugin
 
 # Provider configs — add new providers here
 # llm: path to the LLM module
@@ -30,8 +61,26 @@ providers:
   qwen:
     llm: eval/llms/oaichat.py
     base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
-    api_key: ${DASHSCOPE_API_KEY}
-    model: qwen-max
+    api_key: ${ALIBABA_KEY}
+    model: qwen-plus
+    extra_body:
+      enable_thinking: true
+
+  qwen3.5:
+    llm: eval/llms/oaichat.py
+    base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+    api_key: ${ALIBABA_KEY}
+    model: qwen3.5-plus
+    extra_body:
+      enable_thinking: true
+
+  qwen3.5-moe:
+    llm: eval/llms/oaichat.py
+    base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+    api_key: ${ALIBABA_KEY}
+    model: qwen3.5-397b-a17b
+    extra_body:
+      enable_thinking: true
 
   deepseek:
     llm: eval/llms/oaichat.py
@@ -44,6 +93,12 @@ providers:
     base_url: https://api.mistral.ai/v1
     api_key: ${MISTRAL_API_KEY}
     model: mistral-large-latest
+
+  qwen3.5-nebius:
+    llm: eval/llms/oaichat.py
+    base_url: https://api.tokenfactory.us-central1.nebius.com/v1/
+    api_key: ${NEBIUS_API_KEY}
+    model: Qwen/Qwen3.5-397B-A17B
 
   glm5:
     llm: eval/llms/oaichat.py
@@ -157,9 +212,26 @@ providers:
       reasoning:
         enabled: true
 
+  opus-4.6:
+    llm: eval/llms/oaichat.py
+    base_url: https://api.pinference.ai/api/v1
+    api_key: ${PRIME_API_KEY}
+    model: anthropic/claude-opus-4.6
+
+  # --- Anthropic-compatible ---
+  minimax-m2.7-ant:
+    llm: eval/llms/ant_compat.py
+    base_url: https://api.minimax.io/anthropic
+    api_key: ${MINIMAX_API_KEY}
+    model: MiniMax-M2.7
+
   # --- Native providers ---
   gemini:
     llm: eval/llms/gemini.py
+
+  gemini-3.1-pro:
+    llm: eval/llms/gemini.py
+    model: gemini-3.1-pro-preview
 
   openai:
     llm: eval/llms/openai.py

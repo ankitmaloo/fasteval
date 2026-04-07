@@ -7,10 +7,13 @@ import os
 import csv
 import re
 import shutil
+import asyncio
 import time
 import threading
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, Any
@@ -19,7 +22,7 @@ from google import genai
 from google.genai import types
 from dotenv import load_dotenv
 
-from eval.tools import PythonREPL, repl
+from eval.tools import CODE_SCHEMA, PythonREPL, make_repl, repl
 from eval.log import log
 
 try:
@@ -33,9 +36,6 @@ if TYPE_CHECKING:
     from eval.storage import Storage
 
 load_dotenv()
-
-JUDGE_MODEL = "gemini-3-flash-preview"
-JUDGE_CLIENT = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 EVAL_DIR = Path(__file__).resolve().parent
@@ -70,6 +70,129 @@ Prefer the ARTIFACT CONTEXT block and preloaded variables over rediscovering fil
 Respond with exactly one word: PASS or FAIL
 
 No explanation, no hedging, just PASS or FAIL."""
+
+
+@dataclass(frozen=True, slots=True)
+class JudgeRuntime:
+    provider: str
+    kind: str
+    model: str
+    provider_config_path: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+    reasoning_effort: str | None = None
+    extra_body: dict[str, Any] | None = None
+
+
+_JUDGE_OPENAI_TOOL = {"type": "function", **CODE_SCHEMA}
+_JUDGE_OPENAI_CHAT_TOOL = {"type": "function", "function": CODE_SCHEMA}
+_JUDGE_ANTHROPIC_TOOL = {
+    "name": CODE_SCHEMA["name"],
+    "description": CODE_SCHEMA["description"],
+    "input_schema": CODE_SCHEMA["parameters"],
+}
+
+
+def _load_eval_config(config_path: str | None = None) -> dict[str, Any]:
+    try:
+        import yaml  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError("PyYAML is required to read eval/config.yaml") from exc
+    path = Path(config_path) if config_path else (EVAL_DIR / "config.yaml")
+    if not path.exists():
+        return {}
+    payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(payload, dict):
+        raise ValueError(f"Invalid config payload in {path}")
+    return payload
+
+
+def _resolve_judge_provider_name(
+    judge_provider: str | None = None,
+    provider_config_path: str | None = None,
+) -> str:
+    if judge_provider:
+        return judge_provider
+    payload = _load_eval_config(provider_config_path)
+    judge_cfg = payload.get("judge", {})
+    if isinstance(judge_cfg, dict) and judge_cfg.get("provider"):
+        return str(judge_cfg["provider"])
+    return "gemini"
+
+
+@lru_cache(maxsize=32)
+def _resolve_judge_runtime(
+    judge_provider: str | None = None,
+    provider_config_path: str | None = None,
+) -> JudgeRuntime:
+    from service.engine import _resolve_provider_module
+
+    provider_name = _resolve_judge_provider_name(judge_provider, provider_config_path)
+    module, _ = _resolve_provider_module(provider_name, provider_config_path)
+    stem = Path(getattr(module, "__file__", "")).stem
+
+    if stem == "gemini":
+        return JudgeRuntime(
+            provider=provider_name,
+            kind="gemini",
+            model=os.environ.get("GEMINI_MODEL", getattr(module, "LLM_ID", "gemini-3-flash-preview")),
+            provider_config_path=provider_config_path,
+        )
+    if stem == "openai":
+        return JudgeRuntime(
+            provider=provider_name,
+            kind="openai_responses",
+            model=os.environ.get("OPENAI_MODEL", getattr(module, "LLM_ID", "gpt-5.4")),
+            provider_config_path=provider_config_path,
+            api_key=os.environ.get("OPENAI_API_KEY"),
+            reasoning_effort=os.environ.get("OPENAI_REASONING_EFFORT", "medium"),
+        )
+    if stem == "oaichat":
+        extra_body_raw = os.environ.get("OAICHAT_EXTRA_BODY")
+        return JudgeRuntime(
+            provider=provider_name,
+            kind="openai_chat",
+            model=os.environ["OAICHAT_MODEL"],
+            provider_config_path=provider_config_path,
+            base_url=os.environ["OAICHAT_BASE_URL"],
+            api_key=os.environ["OAICHAT_API_KEY"],
+            extra_body=json.loads(extra_body_raw) if extra_body_raw else None,
+        )
+    if stem == "claude":
+        return JudgeRuntime(
+            provider=provider_name,
+            kind="anthropic",
+            model=getattr(module, "LLM_ID", "claude-opus-4-6"),
+            provider_config_path=provider_config_path,
+            api_key=os.environ.get("ANTHROPIC_API_KEY"),
+        )
+    if stem == "ant_compat":
+        return JudgeRuntime(
+            provider=provider_name,
+            kind="anthropic",
+            model=os.environ["ANTCOMPAT_MODEL"],
+            provider_config_path=provider_config_path,
+            base_url=os.environ["ANTCOMPAT_BASE_URL"],
+            api_key=os.environ["ANTCOMPAT_API_KEY"],
+        )
+    raise ValueError(f"Unsupported judge provider backend for '{provider_name}': {stem}")
+
+
+def _judge_usage_dict(usage: Any) -> dict[str, int]:
+    if usage is None:
+        return {}
+    return {
+        "input_tokens": int(
+            getattr(usage, "prompt_token_count", None)
+            or getattr(usage, "input_tokens", 0)
+            or 0
+        ),
+        "output_tokens": int(
+            getattr(usage, "candidates_token_count", None)
+            or getattr(usage, "output_tokens", 0)
+            or 0
+        ),
+    }
 
 
 def load_dataset(path: Path | None = None) -> list[dict]:
@@ -289,7 +412,7 @@ def build_judge_artifact_bundle(output_dir: str | None, task_id: str | None = No
         prompt_parts.append("Artifact manifest:")
         prompt_parts.extend(_format_manifest_entry(entry) for entry in manifest)
     else:
-        prompt_parts.append("Artifact manifest: no files were produced.")
+        prompt_parts.append("Artifact manifest: no files were produced. The model generated no output files. Do not attempt to access preloaded variables — none exist.")
     if preloaded_files:
         prompt_parts.append("Preloaded artifact objects:")
         for rel_path, names in preloaded_files.items():
@@ -333,27 +456,251 @@ def _gemini_call_with_retry(client, model, contents, config, tag: str, max_retri
     raise RuntimeError(f"{tag} exhausted {max_retries} retries")  # unreachable
 
 
-@_weave_op
-def judge_criterion(task: str, answer: str, criterion: str, tier: str = "", idx: int = 0,
-                    repl_seed: dict | None = None,
-                    output_dir: str | None = None,
-                    artifact_context: str | None = None,
-                    conv_store: Any = None, task_id: str = "") -> bool:
-    """Judge a single criterion with its own REPL instance. Returns True for PASS."""
-    tag = f"[JUDGE {tier}#{idx}]"
-    log.info(f"  {tag} evaluating: {criterion}")
-    judge_repl = PythonREPL(seed_globals=repl_seed, output_dir=output_dir)
-    prompt = (
-        f"TASK:\n{task}\n\n"
-        f"ANSWER:\n{answer}\n\n"
-        f"ARTIFACT CONTEXT:\n{artifact_context or 'No artifact context available.'}\n\n"
-        f"CRITERION:\n{criterion}"
-    )
+def _judge_openai_responses(runtime: JudgeRuntime, prompt: str, judge_repl: Any, tag: str, _jconv) -> tuple[bool, str | None]:
+    from openai import OpenAI
+
+    client = OpenAI(api_key=runtime.api_key, timeout=6000, max_retries=0)
+    input_items: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
+
+    for turn in range(JUDGE_MAX_TURNS):
+        resp = client.responses.create(
+            model=runtime.model,
+            input=input_items,
+            instructions=JUDGE_PROMPT,
+            reasoning={"effort": runtime.reasoning_effort or "low"},
+            tools=[_JUDGE_OPENAI_TOOL],
+        )
+        usage = _judge_usage_dict(resp.usage)
+        fn_calls = [item for item in resp.output if item.type == "function_call"]
+        if not fn_calls:
+            verdict = (resp.output_text or "").strip().upper()
+            passed = verdict.startswith("PASS")
+            _jconv({
+                "turn": turn + 1,
+                "role": "judge_verdict",
+                "verdict": "PASS" if passed else "FAIL",
+                "response": resp.output_text or "",
+                "usage": usage,
+            })
+            return passed, None
+
+        input_items.extend(resp.output)
+        for fc in fn_calls:
+            code = json.loads(fc.arguments).get("code", "")
+            result = judge_repl.run(code)
+            _jconv({
+                "turn": turn + 1,
+                "role": "judge_tool",
+                "tool": fc.name,
+                "code": code,
+                "result": result,
+            })
+            input_items.append({
+                "type": "function_call_output",
+                "call_id": fc.call_id,
+                "output": result,
+            })
+    return False, None
+
+
+def _judge_openai_chat(runtime: JudgeRuntime, prompt: str, judge_repl: Any, tag: str, _jconv) -> tuple[bool, str | None]:
+    from openai import OpenAI
+
+    client = OpenAI(base_url=runtime.base_url, api_key=runtime.api_key)
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": JUDGE_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+
+    for turn in range(JUDGE_MAX_TURNS):
+        kwargs: dict[str, Any] = {
+            "model": runtime.model,
+            "messages": messages,
+            "tools": [_JUDGE_OPENAI_CHAT_TOOL],
+            "tool_choice": "auto",
+        }
+        if runtime.extra_body:
+            kwargs["extra_body"] = runtime.extra_body
+        resp = client.chat.completions.create(**kwargs)
+        raw = resp.model_dump()
+        choice = raw["choices"][0]
+        msg = choice["message"]
+        tool_calls = msg.get("tool_calls") or []
+        if not tool_calls:
+            verdict = (msg.get("content") or "").strip().upper()
+            passed = verdict.startswith("PASS")
+            _jconv({
+                "turn": turn + 1,
+                "role": "judge_verdict",
+                "verdict": "PASS" if passed else "FAIL",
+                "response": msg.get("content") or "",
+                "usage": raw.get("usage") or {},
+            })
+            return passed, None
+
+        messages.append(msg)
+        for tc in tool_calls:
+            args = json.loads(tc["function"]["arguments"])
+            code = args.get("code", "")
+            result = judge_repl.run(code)
+            _jconv({
+                "turn": turn + 1,
+                "role": "judge_tool",
+                "tool": tc["function"]["name"],
+                "code": code,
+                "result": result,
+            })
+            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+    return False, None
+
+
+def _judge_anthropic(runtime: JudgeRuntime, prompt: str, judge_repl: Any, tag: str, _jconv) -> tuple[bool, str | None]:
+    import anthropic
+
+    if runtime.base_url:
+        client = anthropic.Anthropic(base_url=runtime.base_url, api_key=runtime.api_key)
+    else:
+        client = anthropic.Anthropic(api_key=runtime.api_key)
+    messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
+
+    for turn in range(JUDGE_MAX_TURNS):
+        resp = client.messages.create(
+            model=runtime.model,
+            max_tokens=4096,
+            system=JUDGE_PROMPT,
+            messages=messages,
+            tools=[_JUDGE_ANTHROPIC_TOOL],
+        )
+        usage = _judge_usage_dict(resp.usage)
+        tool_uses = [block for block in resp.content if block.type == "tool_use"]
+        if not tool_uses:
+            text = "".join(block.text for block in resp.content if getattr(block, "type", "") == "text")
+            verdict = text.strip().upper()
+            passed = verdict.startswith("PASS")
+            _jconv({
+                "turn": turn + 1,
+                "role": "judge_verdict",
+                "verdict": "PASS" if passed else "FAIL",
+                "response": text,
+                "usage": usage,
+            })
+            return passed, None
+
+        messages.append({"role": "assistant", "content": resp.content})
+        tool_results = []
+        for tu in tool_uses:
+            code = tu.input.get("code", "")
+            result = judge_repl.run(code)
+            _jconv({
+                "turn": turn + 1,
+                "role": "judge_tool",
+                "tool": tu.name,
+                "code": code,
+                "result": result,
+            })
+            tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": result})
+        messages.append({"role": "user", "content": tool_results})
+    return False, None
+
+
+def _judge_gemini(runtime: JudgeRuntime, prompt: str, judge_repl: Any, tag: str, _jconv) -> tuple[bool, str | None]:
+    client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
     contents = [types.Content(role="user", parts=[types.Part(text=prompt)])]
     config = types.GenerateContentConfig(
         system_instruction=JUDGE_PROMPT,
         thinking_config=types.ThinkingConfig(thinking_level="LOW"),
         tools=_judge_tools,
+    )
+
+    for turn in range(JUDGE_MAX_TURNS):
+        resp = _gemini_call_with_retry(client, runtime.model, contents, config, tag)
+        candidate = resp.candidates[0]
+        usage = _judge_usage_dict(resp.usage_metadata)
+        fn_calls = [p for p in candidate.content.parts if p.function_call]
+
+        if not fn_calls:
+            verdict = (resp.text or "").strip().upper()
+            passed = verdict.startswith("PASS")
+            _jconv({
+                "turn": turn + 1,
+                "role": "judge_verdict",
+                "verdict": "PASS" if passed else "FAIL",
+                "response": resp.text or "",
+                "usage": usage,
+            })
+            return passed, None
+
+        contents.append(candidate.content)
+        fn_parts = []
+        for part in fn_calls:
+            fc = part.function_call
+            code = fc.args.get("code", "")
+            result = judge_repl.run(code)
+            _jconv({
+                "turn": turn + 1,
+                "role": "judge_tool",
+                "tool": fc.name,
+                "code": code,
+                "result": result,
+            })
+            fn_parts.append(types.Part(function_response=types.FunctionResponse(
+                name=fc.name, response={"output": result},
+            )))
+        contents.append(types.Content(role="user", parts=fn_parts))
+    return False, None
+
+
+@_weave_op
+def judge_criterion(task: str, answer: str, criterion: str, tier: str = "", idx: int = 0,
+                    repl_seed: dict | None = None,
+                    output_dir: str | None = None,
+                    artifact_context: str | None = None,
+                    conv_store: Any = None, task_id: str = "",
+                    judge_provider: str | None = None,
+                    provider_config_path: str | None = None,
+                    repl_mode: str = "local",
+                    sandbox_template: str | None = None) -> bool:
+    """Judge a single criterion with its own REPL instance. Returns True for PASS."""
+    tag = f"[JUDGE {tier}#{idx}] [{task_id}]"
+    log.info(f"  {tag} evaluating: {criterion}")
+    runtime = _resolve_judge_runtime(judge_provider, provider_config_path)
+    remote_output_dir = None
+    judge_seed = dict(repl_seed or {})
+    judge_artifact_context = artifact_context
+    task_slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", task_id).strip("-") or "judge"
+    if repl_mode == "daytona":
+        remote_output_dir = f".kwbench/judge/{task_slug}/{tier}-{idx}"
+        if judge_seed.get("artifact_root"):
+            judge_seed["artifact_root"] = remote_output_dir
+        manifest = judge_seed.get("artifact_manifest")
+        if isinstance(manifest, list):
+            patched_manifest = []
+            for entry in manifest:
+                if isinstance(entry, dict):
+                    patched = dict(entry)
+                    rel_path = patched.get("relative_path")
+                    if isinstance(rel_path, str):
+                        patched["absolute_path"] = f"{remote_output_dir}/{rel_path}"
+                    patched_manifest.append(patched)
+                else:
+                    patched_manifest.append(entry)
+            judge_seed["artifact_manifest"] = patched_manifest
+        if artifact_context and output_dir:
+            judge_artifact_context = artifact_context.replace(str(output_dir), remote_output_dir)
+    judge_repl = make_repl(
+        repl_mode=repl_mode,
+        task_id=f"{task_slug}-{tier}-{idx}",
+        seed_globals=judge_seed or None,
+        output_dir=output_dir,
+        remote_output_dir=remote_output_dir,
+        sandbox_template=sandbox_template,
+        sync_local_output_on_bootstrap=bool(output_dir),
+    )
+    prompt = (
+        f"TASK:\n{task}\n\n"
+        f"ANSWER:\n{answer}\n\n"
+        f"ARTIFACT CONTEXT:\n{judge_artifact_context or 'No artifact context available.'}\n\n"
+        f"CRITERION:\n{criterion}"
     )
 
     def _jconv(entry: dict) -> None:
@@ -363,62 +710,37 @@ def judge_criterion(task: str, answer: str, criterion: str, tier: str = "", idx:
     _jconv({
         "turn": 0,
         "role": "judge_start",
+        "provider": runtime.provider,
+        "model": runtime.model,
         "tier": tier,
         "idx": idx,
         "criterion": criterion,
-        "artifact_context": artifact_context,
+        "artifact_context": judge_artifact_context,
     })
 
     try:
-        for turn in range(JUDGE_MAX_TURNS):
-            resp = _gemini_call_with_retry(JUDGE_CLIENT, JUDGE_MODEL, contents, config, tag)
-            candidate = resp.candidates[0]
-            usage = resp.usage_metadata
-            fn_calls = [p for p in candidate.content.parts if p.function_call]
-
-            if not fn_calls:
-                verdict = (resp.text or "").strip().upper()
-                passed = verdict.startswith("PASS")
-                log.info(f"  {tag} -> {'PASS' if passed else 'FAIL'} (turns={turn + 1}, {usage.prompt_token_count}in/{usage.candidates_token_count}out)")
-                _jconv({
-                    "turn": turn + 1, "role": "judge_verdict", "tier": tier, "idx": idx,
-                    "criterion": criterion, "verdict": "PASS" if passed else "FAIL",
-                    "response": resp.text or "",
-                    "usage": {"input_tokens": usage.prompt_token_count, "output_tokens": usage.candidates_token_count},
-                })
-                return (passed, None)
-
-            contents.append(candidate.content)
-            fn_parts = []
-            for part in fn_calls:
-                fc = part.function_call
-                if fc.name == "execute_code":
-                    code = fc.args.get("code", "")
-                    log.info(f"  {tag} turn {turn + 1} code:\n{code}")
-                    result = judge_repl.run(code)
-                    log.info(f"  {tag} code out: {result}")
-                else:
-                    result = f"[Unknown tool: {fc.name}]"
-                _jconv({
-                    "turn": turn + 1, "role": "judge_tool", "tier": tier, "idx": idx,
-                    "criterion": criterion, "tool": fc.name,
-                    "code": fc.args.get("code", "") if fc.name == "execute_code" else None,
-                    "result": result,
-                })
-                fn_parts.append(types.Part(function_response=types.FunctionResponse(
-                    name=fc.name, response={"output": result},
-                )))
-            contents.append(types.Content(role="user", parts=fn_parts))
-
-        log.info(f"  {tag} -> exhausted {JUDGE_MAX_TURNS} turns, defaulting to verdict from last response")
-        _jconv({"turn": JUDGE_MAX_TURNS, "role": "judge_verdict", "tier": tier, "idx": idx,
-                "criterion": criterion, "verdict": "FAIL", "exhausted": True})
-        return (False, None)  # (passed, error)
+        if runtime.kind == "gemini":
+            passed, error = _judge_gemini(runtime, prompt, judge_repl, tag, _jconv)
+        elif runtime.kind == "openai_responses":
+            passed, error = _judge_openai_responses(runtime, prompt, judge_repl, tag, _jconv)
+        elif runtime.kind == "openai_chat":
+            passed, error = _judge_openai_chat(runtime, prompt, judge_repl, tag, _jconv)
+        elif runtime.kind == "anthropic":
+            passed, error = _judge_anthropic(runtime, prompt, judge_repl, tag, _jconv)
+        else:
+            raise ValueError(f"Unsupported judge runtime kind: {runtime.kind}")
+        log.info(f"  {tag} -> {'PASS' if passed else 'FAIL'}")
+        return passed, error
     except Exception as e:
         log.error(f"  {tag} FATAL: {e}")
         _jconv({"turn": -1, "role": "judge_error", "tier": tier, "idx": idx,
                 "criterion": criterion, "error": str(e)})
         return (False, str(e))
+    finally:
+        try:
+            judge_repl.close()
+        except Exception:
+            pass
 
 
 @_weave_op
@@ -432,6 +754,10 @@ def judge_rubric(
     artifact_context: str | None = None,
     conv_store: Any = None,
     task_id: str = "",
+    judge_provider: str | None = None,
+    provider_config_path: str | None = None,
+    repl_mode: str = "local",
+    sandbox_template: str | None = None,
 ) -> dict:
     """Judge all rubric criteria in parallel. Returns eval dict."""
     mandatory = rubric.get("mandatory", [])
@@ -455,8 +781,23 @@ def judge_rubric(
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(judge_criterion, task, answer, criterion, tier, idx, repl_seed, output_dir, artifact_context,
-                            conv_store=conv_store, task_id=task_id): (tier, idx)
+            executor.submit(
+                judge_criterion,
+                task,
+                answer,
+                criterion,
+                tier,
+                idx,
+                repl_seed,
+                output_dir,
+                artifact_context,
+                conv_store=conv_store,
+                task_id=task_id,
+                judge_provider=judge_provider,
+                provider_config_path=provider_config_path,
+                repl_mode=repl_mode,
+                sandbox_template=sandbox_template,
+            ): (tier, idx)
             for tier, idx, criterion in all_criteria
         }
         for future in as_completed(futures):

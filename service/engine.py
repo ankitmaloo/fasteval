@@ -6,8 +6,10 @@ import json
 import os
 import re
 import shutil
+import threading
+import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from importlib.machinery import ModuleSpec
 from pathlib import Path
@@ -23,13 +25,16 @@ from clients import (
 )
 from runner import CaseResult, EvalCase, Runner
 
+from eval.benchmarks.base import ExecutionProfile
 from eval.log import log
+from eval.scorers import RubricJudgeScorer, ScorerResult, resolve_scorer
 from eval.storage import Storage, fire_and_forget
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 EVAL_DIR = Path(__file__).resolve().parent
 DATASET_PATH = BASE_DIR / "dataset.jsonl"
 RESULTS_DIR = EVAL_DIR / "results"
+HEARTBEAT_INTERVAL_S = 5.0
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -45,6 +50,11 @@ class AsyncRunConfig:
     replay_fixtures: str | None = None
     provider: str | None = None
     provider_config_path: str | None = None
+    benchmark: str | None = None
+    runtime_type: Literal["local", "daytona"] | None = None
+    repl_mode: Literal["local", "daytona"] = "local"
+    sandbox_template: str | None = None
+    sandbox_concurrency: int | None = None
     eval_sem: int = 64
     cpu_sem: int | None = None
     max_retries: int = 2
@@ -58,6 +68,7 @@ class AsyncRunConfig:
     wandb_project: str | None = None
     weave_project: str | None = None
     judge_enabled: bool = False
+    judge_provider: str | None = None
     judge_sem: int = 4
     judge_criterion_workers: int = 4
     hf_results_upload: bool = field(default_factory=lambda: _env_bool("HF_RESULTS_UPLOAD", False))
@@ -200,7 +211,7 @@ def _extract_completed(path: Path) -> tuple[set[str], int, int]:
                 ok_count += 1
             elif status == "error":
                 failed_count += 1
-            elif "eval" in payload:
+            elif "scoring" in payload or "eval" in payload:
                 ok_count += 1
     return ids, ok_count, failed_count
 
@@ -276,16 +287,7 @@ def _expand_env(value: Any) -> Any:
 
 
 def _load_provider_map(config_path: Path) -> dict[str, dict[str, Any]]:
-    try:
-        import yaml  # type: ignore
-    except ImportError as exc:  # pragma: no cover - exercised in provider mode only
-        raise RuntimeError(
-            "PyYAML is required for provider resolution from config.yaml"
-        ) from exc
-
-    if not config_path.exists():
-        raise ValueError(f"Provider config not found: {config_path}")
-    payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    payload = _load_yaml_payload(config_path)
     providers = payload.get("providers", {})
     if not isinstance(providers, dict):
         raise ValueError(f"Invalid providers map in {config_path}")
@@ -296,11 +298,57 @@ def _load_provider_map(config_path: Path) -> dict[str, dict[str, Any]]:
     return expanded
 
 
+def _load_yaml_payload(config_path: Path) -> dict[str, Any]:
+    try:
+        import yaml  # type: ignore
+    except ImportError as exc:  # pragma: no cover - exercised in provider mode only
+        raise RuntimeError(
+            "PyYAML is required for provider resolution from config.yaml"
+        ) from exc
+
+    if not config_path.exists():
+        raise ValueError(f"Provider config not found: {config_path}")
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    if not isinstance(payload, dict):
+        raise ValueError(f"Invalid config payload in {config_path}")
+    return payload
+
+
 def _load_provider_module(path: Path, cfg: dict[str, Any]) -> ModuleType:
-    for key in ("base_url", "api_key", "model"):
-        value = cfg.get(key)
-        if value:
-            os.environ[f"OAICHAT_{key.upper()}"] = str(value)
+    for key in ("OAICHAT_BASE_URL", "OAICHAT_API_KEY", "OAICHAT_MODEL", "OAICHAT_EXTRA_BODY"):
+        os.environ.pop(key, None)
+
+    if path.stem == "oaichat":
+        for key in ("base_url", "api_key", "model"):
+            value = cfg.get(key)
+            if value:
+                os.environ[f"OAICHAT_{key.upper()}"] = str(value)
+        if cfg.get("extra_body"):
+            os.environ["OAICHAT_EXTRA_BODY"] = json.dumps(cfg["extra_body"])
+
+    if path.stem == "openai":
+        if cfg.get("model"):
+            os.environ["OPENAI_MODEL"] = str(cfg["model"])
+        else:
+            os.environ.pop("OPENAI_MODEL", None)
+        if cfg.get("reasoning_effort"):
+            os.environ["OPENAI_REASONING_EFFORT"] = str(cfg["reasoning_effort"])
+        else:
+            os.environ.pop("OPENAI_REASONING_EFFORT", None)
+
+    if path.stem == "gemini":
+        if cfg.get("model"):
+            os.environ["GEMINI_MODEL"] = str(cfg["model"])
+        else:
+            os.environ.pop("GEMINI_MODEL", None)
+
+    if path.stem == "ant_compat":
+        for key in ("ANTCOMPAT_BASE_URL", "ANTCOMPAT_API_KEY", "ANTCOMPAT_MODEL"):
+            os.environ.pop(key, None)
+        for key in ("base_url", "api_key", "model"):
+            value = cfg.get(key)
+            if value:
+                os.environ[f"ANTCOMPAT_{key.upper()}"] = str(value)
 
     spec: ModuleSpec | None = importlib.util.spec_from_file_location(
         f"async_llm_{path.stem}", str(path)
@@ -352,6 +400,73 @@ def _resolve_provider_module(
     return module, provider
 
 
+def _resolve_runtime_config(config: AsyncRunConfig) -> AsyncRunConfig:
+    config_path = (
+        Path(config.provider_config_path)
+        if config.provider_config_path
+        else (EVAL_DIR / "config.yaml")
+    )
+    if not config_path.exists():
+        return config
+
+    payload = _load_yaml_payload(config_path)
+    sandbox_cfg = payload.get("sandbox", {})
+    if not isinstance(sandbox_cfg, dict):
+        sandbox_cfg = {}
+    judge_cfg = payload.get("judge", {})
+    if not isinstance(judge_cfg, dict):
+        judge_cfg = {}
+
+    runtime_cfg = payload.get("runtime", {})
+    if not isinstance(runtime_cfg, dict):
+        runtime_cfg = {}
+
+    merged_sandbox: dict[str, Any] = dict(sandbox_cfg)
+    if config.client == "provider" and config.provider:
+        providers = payload.get("providers", {})
+        provider_cfg = providers.get(config.provider, {}) if isinstance(providers, dict) else {}
+        if not isinstance(provider_cfg, dict):
+            provider_cfg = {}
+        provider_runtime_cfg = provider_cfg.get("runtime", {})
+        if not isinstance(provider_runtime_cfg, dict):
+            provider_runtime_cfg = {}
+        provider_sandbox_cfg = provider_cfg.get("sandbox", {})
+        if not isinstance(provider_sandbox_cfg, dict):
+            provider_sandbox_cfg = {}
+        merged_sandbox.update(runtime_cfg)
+        merged_sandbox.update(provider_runtime_cfg)
+        merged_sandbox.update(provider_sandbox_cfg)
+    else:
+        merged_sandbox.update(runtime_cfg)
+
+    resolved_mode = config.runtime_type or config.repl_mode
+    if resolved_mode == "local" and merged_sandbox.get("mode") in {"local", "daytona"}:
+        resolved_mode = str(merged_sandbox["mode"])
+    if resolved_mode == "local" and merged_sandbox.get("type") in {"local", "daytona"}:
+        resolved_mode = str(merged_sandbox["type"])
+
+    resolved_template = config.sandbox_template
+    if resolved_template is None and merged_sandbox.get("template"):
+        resolved_template = str(merged_sandbox["template"])
+
+    resolved_concurrency = config.sandbox_concurrency
+    if resolved_concurrency is None and merged_sandbox.get("concurrency") is not None:
+        resolved_concurrency = int(merged_sandbox["concurrency"])
+
+    resolved_judge_provider = config.judge_provider
+    if resolved_judge_provider is None and judge_cfg.get("provider"):
+        resolved_judge_provider = str(judge_cfg["provider"])
+
+    return replace(
+        config,
+        runtime_type=resolved_mode,
+        repl_mode=resolved_mode,
+        sandbox_template=resolved_template,
+        sandbox_concurrency=resolved_concurrency,
+        judge_provider=resolved_judge_provider,
+    )
+
+
 def _task_prompt(task: dict[str, Any]) -> str:
     if task.get("task"):
         return str(task["task"])
@@ -365,16 +480,87 @@ def _task_id(task: dict[str, Any], idx: int) -> str:
     return str(value)
 
 
-def _prepare_task_output_dir(task: dict[str, Any]) -> str | None:
-    output_dir = task.get("output_dir")
-    if not output_dir:
-        return None
-    from eval.core import _resolve_output_dir
+class ConvStore:
+    """Thread-safe conversation store that appends only dirty task snapshots."""
+
+    def __init__(self, path: Path):
+        self._path = path
+        self._lock = threading.Lock()
+        self._data: dict[str, dict[str, Any]] = {}
+        self._dirty: set[str] = set()
+        self._load()
+
+    def append(self, task_id: str, entry: dict) -> None:
+        """Append a conversation turn for a task (in-memory only until flush)."""
+        with self._lock:
+            if task_id not in self._data:
+                self._data[task_id] = {"conversation": [], "judge": []}
+            entry["ts"] = datetime.now(timezone.utc).isoformat()
+            self._data[task_id]["conversation"].append(entry)
+            self._dirty.add(task_id)
+
+    def append_judge(self, task_id: str, entry: dict) -> None:
+        """Append a judge turn for a task (in-memory only until flush)."""
+        with self._lock:
+            if task_id not in self._data:
+                self._data[task_id] = {"conversation": [], "judge": []}
+            entry["ts"] = datetime.now(timezone.utc).isoformat()
+            self._data[task_id]["judge"].append(entry)
+            self._dirty.add(task_id)
+
+    def flush(self) -> None:
+        """Append dirty task snapshots to disk."""
+        self._flush()
+
+    def _load(self) -> None:
+        """Load existing conv data from disk if present."""
+        if not self._path.exists():
+            return
+        try:
+            with self._path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    row = json.loads(line)
+                    tid = row.pop("task_id", None)
+                    if tid:
+                        self._data[tid] = {"conversation": row.get("conversation", []), "judge": row.get("judge", [])}
+        except Exception as e:
+            log.warning(f"Failed to load conv store: {e}")
+
+    def _flush(self) -> None:
+        with self._lock:
+            if not self._dirty:
+                return
+            dirty_ids = tuple(sorted(self._dirty))
+            snapshot = {
+                tid: {
+                    "conversation": list(self._data[tid]["conversation"]),
+                    "judge": list(self._data[tid]["judge"]),
+                }
+                for tid in dirty_ids
+            }
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            with self._path.open("a", encoding="utf-8") as f:
+                for tid in dirty_ids:
+                    data = snapshot[tid]
+                    line = {"task_id": tid, **data}
+                    f.write(json.dumps(line, default=str) + "\n")
+                f.flush()
+            with self._lock:
+                self._dirty.difference_update(dirty_ids)
+        except Exception as e:
+            log.warning(f"Failed to flush conv store: {e}")
+
+
+def _prepare_task_output_dir(task: dict[str, Any]) -> str:
+    output_dir = task.get("output_dir") or "artifacts"
+    from eval.core import _clear_output_dir, _resolve_output_dir
     path = _resolve_output_dir(str(output_dir), task_id=str(task.get("id", "")))
     path.mkdir(parents=True, exist_ok=True)
-    for child in path.iterdir():
-        if child.is_file():
-            child.unlink()
+    _clear_output_dir(path)
     return str(path)
 
 
@@ -387,21 +573,286 @@ def _load_references(task: dict[str, Any]) -> dict[str, Any]:
     return read_reference_files(ref_paths)
 
 
-def _provider_case_context(task: dict[str, Any]) -> ProviderCaseContext:
-    from eval.tools import PythonREPL
+def _resolve_reference_source_path(rel_path: str) -> Path | None:
+    candidate = BASE_DIR / rel_path
+    if candidate.exists():
+        return candidate
+    candidate = BASE_DIR / "reference_files" / rel_path
+    if candidate.exists():
+        return candidate
+    return None
+
+
+def _reference_var_base(rel_path: str) -> str:
+    stem = Path(rel_path).stem.lower()
+    return re.sub(r"[^a-z0-9]+", "_", stem).strip("_") or "reference"
+
+
+def _extract_docx_tables(path: Path) -> list[list[list[str]]]:
+    from docx import Document
+
+    doc = Document(str(path))
+    tables: list[list[list[str]]] = []
+    for table in doc.tables:
+        rows: list[list[str]] = []
+        for row in table.rows:
+            rows.append([cell.text.strip() for cell in row.cells])
+        tables.append(rows)
+    return tables
+
+
+def _reference_seed_globals(task: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+    ref_paths = task.get("reference_files")
+    if not ref_paths:
+        return {}, None
+
+    seed: dict[str, Any] = {}
+    parsed_refs: dict[str, dict[str, Any]] = {}
+    convenience_vars: list[str] = []
+
+    from eval.core import _parse_docx
+
+    for rel_path in ref_paths:
+        resolved = _resolve_reference_source_path(str(rel_path))
+        if resolved is None:
+            continue
+
+        entry: dict[str, Any] = {"path": str(resolved.resolve())}
+        var_base = _reference_var_base(str(rel_path))
+        ext = resolved.suffix.lower()
+
+        if ext == ".docx":
+            try:
+                text = _parse_docx(resolved)
+                tables = _extract_docx_tables(resolved)
+            except Exception:
+                continue
+            entry["text"] = text
+            entry["tables"] = tables
+            seed[f"{var_base}_text"] = text
+            seed[f"{var_base}_tables"] = tables
+            convenience_vars.extend([f"{var_base}_text", f"{var_base}_tables"])
+
+        if entry.keys() != {"path"}:
+            parsed_refs[str(rel_path)] = entry
+
+    if not parsed_refs:
+        note = (
+            "Reference documents are already parsed below. "
+            "Do not try to reopen the original reference files from disk."
+        )
+        return {}, note
+
+    seed["_reference_files"] = parsed_refs
+    note = (
+        "Reference documents are already parsed below. "
+        "Do not try to reopen the original reference files from disk. "
+        "In the Python REPL, parsed reference data is available via `_reference_files`."
+    )
+    if convenience_vars:
+        preview = ", ".join(f"`{name}`" for name in convenience_vars[:4])
+        note += f" Convenience variables are also available: {preview}."
+    note += " Prefer those preloaded values over rediscovering file paths."
+    return seed, note
+
+
+def _apply_allowed_tools(case_config: dict[str, Any], allowed_tools: list[str] | None) -> None:
+    if allowed_tools is None:
+        return
+    allowed = {str(tool).strip().lower() for tool in allowed_tools}
+    case_config["enable_code"] = "code" in allowed or "python" in allowed
+    case_config["enable_bash"] = "bash" in allowed or "shell" in allowed
+    case_config["enable_search"] = "search" in allowed or "web_search" in allowed
+
+
+def _resolve_execution_profile(
+    task: dict[str, Any],
+    *,
+    benchmark_plugin: Any | None,
+    runtime_type: str,
+    local_output_dir: str,
+    prompt_repl_note: str | None,
+) -> dict[str, Any]:
+    profile = ExecutionProfile()
+    if benchmark_plugin is not None and hasattr(benchmark_plugin, "execution_profile"):
+        plugin_profile = benchmark_plugin.execution_profile(task)
+        if plugin_profile is not None:
+            profile = plugin_profile
+
+    task_slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(task.get("id", ""))).strip("-") or "case"
+    prompt_output_dir: str | None = None
+    bash_cwd: str | None = None
+    python_cwd: str | None = None
+    write_redirect_dir: str | None = None
+    write_mode: str | None = None
+    remote_workspace_root: str | None = None
+    remote_write_redirect_dir: str | None = None
+    remote_write_mode: str | None = None
+    remote_sync_dir: str | None = None
+
+    prompt_parts = [part for part in (prompt_repl_note, profile.prompt_extra_instructions) if part]
+
+    if runtime_type == "daytona":
+        remote_root = f".kwbench/tasks/{task_slug}"
+        remote_artifact_dir = f"{remote_root}/output"
+        remote_workspace_root = profile.workspace_root or remote_artifact_dir
+        bash_cwd = profile.bash_cwd or remote_workspace_root
+        python_cwd = profile.python_cwd or remote_workspace_root
+        if profile.python_write_policy == "artifact_dir":
+            remote_write_redirect_dir = remote_artifact_dir
+            remote_write_mode = "redirect"
+        elif profile.python_write_policy == "cwd":
+            remote_write_redirect_dir = python_cwd
+            remote_write_mode = "strict"
+        if profile.sync_policy == "artifact_dir":
+            remote_sync_dir = remote_artifact_dir
+        if profile.prompt_output_policy == "artifact_dir":
+            prompt_output_dir = remote_artifact_dir
+            prompt_parts.append(
+                "Python and bash tools run inside a Daytona sandbox for this task. "
+                f"Use the sandbox paths listed above and write outputs only inside `{remote_artifact_dir}`. "
+                f"Artifacts are synced back to the local task directory after execution: `{local_output_dir}`."
+            )
+        else:
+            prompt_parts.append(
+                "Python and bash tools run inside a Daytona sandbox for this task. "
+                f"Use the sandbox workspace `{remote_workspace_root}` and create files at the benchmark-specified paths. "
+                "Do not relocate benchmark outputs into the harness artifact directory."
+            )
+    else:
+        workspace_root = profile.workspace_root or local_output_dir
+        bash_cwd = profile.bash_cwd or workspace_root
+        python_cwd = profile.python_cwd or workspace_root
+        if profile.python_write_policy == "artifact_dir":
+            write_redirect_dir = local_output_dir
+            write_mode = "redirect"
+        elif profile.python_write_policy == "cwd":
+            write_redirect_dir = python_cwd
+            write_mode = "strict"
+        if profile.prompt_output_policy == "artifact_dir":
+            prompt_output_dir = local_output_dir
+
+    return {
+        "profile": profile,
+        "task_slug": task_slug,
+        "prompt_output_dir": prompt_output_dir,
+        "prompt_note": " ".join(prompt_parts) if prompt_parts else None,
+        "bash_cwd": bash_cwd,
+        "python_cwd": python_cwd,
+        "write_redirect_dir": write_redirect_dir,
+        "write_mode": write_mode,
+        "remote_workspace_root": remote_workspace_root,
+        "remote_write_redirect_dir": remote_write_redirect_dir,
+        "remote_write_mode": remote_write_mode,
+        "remote_sync_dir": remote_sync_dir,
+    }
+
+
+def _provider_case_context(
+    task: dict[str, Any],
+    *,
+    conv_store: ConvStore | None = None,
+    benchmark_plugin: Any | None = None,
+) -> ProviderCaseContext:
+    from eval.tools import make_tool_runtime, make_tool_session
 
     cfg = task.get("config", {})
     case_config = dict(cfg) if isinstance(cfg, dict) else {}
-    case_config["_repl"] = PythonREPL()
-    case_config["_task_id"] = str(task.get("id", ""))
+    task_id = str(task.get("id", ""))
+    case_config["_task_id"] = task_id
+    try:
+        case_config["_max_turns"] = int(task.get("max_steps", case_config.get("case_max_steps", 0)))
+    except (TypeError, ValueError):
+        pass
+    if benchmark_plugin is not None:
+        allowed_tools = benchmark_plugin.allowed_tools(task)
+        _apply_allowed_tools(case_config, allowed_tools)
 
     output_dir = _prepare_task_output_dir(task)
-    if output_dir:
-        case_config["_output_dir"] = output_dir
+    plugin_context = None
+    if benchmark_plugin is not None:
+        plugin_context = benchmark_plugin.build_case_context(task)
+    references = plugin_context if plugin_context is not None else _load_references(task)
+    seed_globals, prompt_repl_note = _reference_seed_globals(task)
+    prompt_text = _task_prompt(task)
+    runtime_type = str(case_config.get("runtime_type") or case_config.get("repl_mode") or "local")
+    if benchmark_plugin is not None:
+        prompt_override = benchmark_plugin.build_prompt(task, references)
+        if prompt_override is not None:
+            prompt_text = prompt_override
+    profile_ctx = _resolve_execution_profile(
+        task,
+        benchmark_plugin=benchmark_plugin,
+        runtime_type=runtime_type,
+        local_output_dir=output_dir,
+        prompt_repl_note=prompt_repl_note,
+    )
+
+    runtime = make_tool_runtime(runtime_type)
+    case_config["_tool_runtime"] = runtime
+    case_config["_runtime_type"] = runtime_type
+
+    if runtime_type == "daytona":
+        task_slug = profile_ctx["task_slug"]
+        remote_root = f".kwbench/tasks/{task_slug}"
+        remote_reference_files: dict[str, str] = {}
+        prompt_reference_paths: dict[str, str] = {}
+        for ref_name, local_path in references.get("paths", {}).items():
+            remote_path = f"{remote_root}/refs/{Path(ref_name).as_posix()}"
+            remote_reference_files[str(local_path)] = remote_path
+            prompt_reference_paths[str(ref_name)] = remote_path
+
+        references = {
+            **references,
+            "paths": prompt_reference_paths,
+        }
+        tool_session = make_tool_session(
+            runtime_type="daytona",
+            task_id=task_slug,
+            seed_globals=seed_globals or None,
+            output_dir=output_dir,
+            remote_output_dir=profile_ctx["prompt_output_dir"],
+            working_dir=profile_ctx["python_cwd"],
+            write_redirect_dir=profile_ctx["write_redirect_dir"],
+            write_mode=profile_ctx["write_mode"],
+            remote_working_dir=profile_ctx["remote_workspace_root"],
+            remote_write_redirect_dir=profile_ctx["remote_write_redirect_dir"],
+            remote_write_mode=profile_ctx["remote_write_mode"],
+            remote_sync_dir=profile_ctx["remote_sync_dir"],
+            remote_reference_files=remote_reference_files,
+            sandbox_template=case_config.get("sandbox_template"),
+        )
+    else:
+        tool_session = make_tool_session(
+            runtime_type="local",
+            task_id=task_id,
+            seed_globals=seed_globals or None,
+            output_dir=output_dir,
+            working_dir=profile_ctx["python_cwd"],
+            write_redirect_dir=profile_ctx["write_redirect_dir"],
+            write_mode=profile_ctx["write_mode"],
+        )
+
+    case_config["_tool_session"] = tool_session
+    case_config["_repl"] = tool_session
+    case_config["_output_dir"] = profile_ctx["prompt_output_dir"]
+    case_config["_local_output_dir"] = output_dir
+    case_config["_bash_cwd"] = profile_ctx["bash_cwd"]
+    case_config["_python_cwd"] = profile_ctx["python_cwd"]
+    case_config["_write_redirect_dir"] = profile_ctx["write_redirect_dir"]
+    case_config["_write_mode"] = profile_ctx["write_mode"]
+    case_config["_remote_workspace_root"] = profile_ctx["remote_workspace_root"]
+    case_config["_remote_write_redirect_dir"] = profile_ctx["remote_write_redirect_dir"]
+    case_config["_remote_write_mode"] = profile_ctx["remote_write_mode"]
+    case_config["_remote_sync_dir"] = profile_ctx["remote_sync_dir"]
+    if profile_ctx["prompt_note"]:
+        case_config["_prompt_repl_note"] = profile_ctx["prompt_note"]
+    if conv_store:
+        case_config["_conv_store"] = conv_store
 
     return ProviderCaseContext(
-        task_text=_task_prompt(task),
-        references=_load_references(task),
+        task_text=prompt_text,
+        references=references,
         config=case_config,
     )
 
@@ -415,11 +866,22 @@ def _to_case(task: dict[str, Any], idx: int, config: AsyncRunConfig) -> EvalCase
     tool_payload = task.get("tool_payload", config.case_tool_payload)
     max_steps = int(task.get("max_steps", config.case_max_steps))
 
-    metadata = {
+    metadata: dict[str, Any] = {
         "source": task.get("source"),
         "category": task.get("category"),
         "task_config": task_config,
     }
+
+    # Extended schema fields (all optional, absent = current behavior)
+    for key in (
+        "ground_truth", "match_type", "case_sensitive", "normalize",
+        "verifier", "setup", "environment", "session",
+        "allowed_tools", "artifact_paths", "timeout",
+    ):
+        value = task.get(key)
+        if value is not None:
+            metadata[key] = value
+
     return EvalCase(
         case_id=_task_id(task, idx),
         prompt=_task_prompt(task),
@@ -469,6 +931,7 @@ def _result_row(
     thinking = _extract_thinking(llm_metadata)
     if thinking is not None:
         row["thinking"] = thinking
+    # scoring field is populated later by scorer dispatch
     return row
 
 
@@ -507,34 +970,13 @@ def _build_judged_answer(task: dict[str, Any], llm_answer: str) -> str:
     if not output_dir_name:
         return llm_answer
 
-    from eval.core import _collect_output_files, _resolve_output_dir
+    from eval.core import build_judge_artifact_bundle
 
-    task_out_dir = _resolve_output_dir(str(output_dir_name), task_id=str(task.get("id", "")))
-    output = _collect_output_files(task_out_dir)
-
-    judged_answer = llm_answer
-    if output["inline"]:
-        judged_answer = f"{judged_answer}\n\n--- OUTPUT FILES ---\n{output['inline']}"
-    if output["paths"]:
-        # Excel files are pre-loaded into the REPL — just note their names
-        xlsx = [p for p in output["paths"] if p.lower().endswith((".xlsx", ".xls"))]
-        other = [p for p in output["paths"] if p not in xlsx]
-        if xlsx:
-            from pathlib import Path as _P
-            names = [_P(p).stem.replace(" ", "_").replace("-", "_") for p in xlsx]
-            judged_answer += (
-                "\n\n--- EXCEL FILES (pre-loaded in REPL) ---\n"
-                + "\n".join(
-                    f"- {_P(p).name}: use `{n}_data` (cached values) or `{n}_formulas` (raw formulas)"
-                    for p, n in zip(xlsx, names)
-                )
-            )
-        if other:
-            judged_answer += (
-                "\n\n--- DATA FILES (use REPL to read) ---\n"
-                + "\n".join(f"- {path}" for path in other)
-            )
-    return judged_answer
+    bundle = build_judge_artifact_bundle(str(output_dir_name), task_id=str(task.get("id", "")))
+    prompt_context = bundle.get("prompt_context")
+    if not prompt_context:
+        return llm_answer
+    return f"{llm_answer}\n\n--- ARTIFACT CONTEXT ---\n{prompt_context}"
 
 
 def _judge_task_with_rubric(
@@ -543,22 +985,36 @@ def _judge_task_with_rubric(
     *,
     criterion_workers: int,
     rubric: dict[str, list[Any]] | None = None,
+    conv_store: Any = None,
+    judge_provider: str | None = None,
+    provider_config_path: str | None = None,
+    repl_mode: str = "local",
+    sandbox_template: str | None = None,
 ) -> dict[str, Any] | None:
     if rubric is None:
         rubric = _sanitize_rubric(task.get("rubric"))
     if rubric is None:
         return None
 
-    from eval.core import judge_rubric, score_rubric, _preload_output_files
+    from eval.core import build_judge_artifact_bundle, judge_rubric, score_rubric
 
-    judged_answer = _build_judged_answer(task, llm_answer)
-    repl_seed = _preload_output_files(task.get("output_dir"), task_id=str(task.get("id", "")))
+    task_id = str(task.get("id", ""))
+    output_dir_name = task.get("output_dir") or "artifacts"
+    artifact_bundle = build_judge_artifact_bundle(str(output_dir_name), task_id=task_id)
     eval_results = judge_rubric(
         str(task.get("task", "")),
-        judged_answer,
+        llm_answer,
         rubric,
         criterion_workers=criterion_workers,
-        repl_seed=repl_seed or None,
+        repl_seed=artifact_bundle["repl_seed"] or None,
+        output_dir=artifact_bundle["artifact_root"],
+        artifact_context=artifact_bundle["prompt_context"],
+        conv_store=conv_store,
+        task_id=task_id,
+        judge_provider=judge_provider,
+        provider_config_path=provider_config_path,
+        repl_mode=repl_mode,
+        sandbox_template=sandbox_template,
     )
     task_score = score_rubric(
         eval_results["mandatory"],
@@ -592,6 +1048,16 @@ def _sanitize_rubric(raw_rubric: Any) -> dict[str, list[Any]] | None:
 
 def _cpu_limit(cpu_sem: int | None) -> int:
     return min(8, os.cpu_count() or 1) if cpu_sem is None else cpu_sem
+
+
+def _runtime_type(config: AsyncRunConfig) -> str:
+    return config.runtime_type or config.repl_mode
+
+
+def _tool_limit(config: AsyncRunConfig) -> int:
+    if _runtime_type(config) == "daytona" and config.sandbox_concurrency is not None:
+        return config.sandbox_concurrency
+    return _cpu_limit(config.cpu_sem)
 
 
 def _resolve_weave_project(config: AsyncRunConfig) -> str | None:
@@ -652,7 +1118,11 @@ def _init_wandb(
             "client": config.client,
             "eval_sem": config.eval_sem,
             "cpu_sem": config.cpu_sem,
+            "runtime_type": _runtime_type(config),
+            "repl_mode": config.repl_mode,
+            "sandbox_concurrency": config.sandbox_concurrency,
             "judge_enabled": config.judge_enabled,
+            "judge_provider": config.judge_provider,
             "judge_sem": config.judge_sem,
             "judge_criterion_workers": config.judge_criterion_workers,
         },
@@ -784,8 +1254,9 @@ def _upload_results_to_hf_dataset(
 def _build_client(
     config: AsyncRunConfig,
     *,
-    remaining_cases: list[EvalCase],
-    remaining_tasks: list[dict[str, Any]],
+    task_by_id: dict[str, dict[str, Any]],
+    conv_store: ConvStore | None = None,
+    benchmark_plugin: Any | None = None,
 ) -> tuple[str, LLMClient]:
     if config.client == "fake":
         return (
@@ -808,16 +1279,44 @@ def _build_client(
         module, provider_name = _resolve_provider_module(
             config.provider, config.provider_config_path
         )
-        contexts: dict[str, ProviderCaseContext] = {}
-        for case, task in zip(remaining_cases, remaining_tasks, strict=True):
-            contexts[case.case_id] = _provider_case_context(task)
         llm_id = str(getattr(module, "LLM_ID", f"provider-{provider_name}"))
         generate_fn = getattr(module, "generate_async", None) or module.generate
         mode = "async" if getattr(module, "generate_async", None) else "sync"
         log.info(f"[ASYNC] provider={provider_name} llm_id={llm_id} generate_mode={mode}")
+
+        def _context_factory(case_id: str) -> ProviderCaseContext:
+            task = task_by_id.get(case_id)
+            if task is None:
+                raise KeyError(f"Missing provider task for case_id={case_id!r}")
+            task_cfg = task.get("config", {})
+            if not isinstance(task_cfg, dict):
+                task_cfg = {}
+            task_with_runtime = dict(task)
+            task_with_runtime["config"] = {
+                **task_cfg,
+                "runtime_type": _runtime_type(config),
+                "repl_mode": config.repl_mode,
+                "sandbox_template": config.sandbox_template,
+                "case_max_steps": int(task.get("max_steps", config.case_max_steps)),
+            }
+            context_kwargs: dict[str, Any] = {"conv_store": conv_store}
+            if benchmark_plugin is not None:
+                context_kwargs["benchmark_plugin"] = benchmark_plugin
+            context = _provider_case_context(task_with_runtime, **context_kwargs)
+            if benchmark_plugin is not None:
+                async def _prepare_case_once() -> None:
+                    repl = context.config.get("_tool_session") or context.config.get("_repl")
+                    await benchmark_plugin.prepare_case(task, repl)
+
+                context.config["_prepare_case"] = _prepare_case_once
+            return context
+
         return (
             llm_id,
-            ProviderLLMClient(generate_fn=generate_fn, case_contexts=contexts),
+            ProviderLLMClient(
+                generate_fn=generate_fn,
+                case_context_factory=_context_factory,
+            ),
         )
 
     raise ValueError(f"Unsupported client: {config.client}")
@@ -850,14 +1349,28 @@ async def _run_async_eval(
     task_ids: set[str] | None,
     storage: Storage | None,
 ) -> Path:
-    if config.judge_enabled and not os.environ.get("GEMINI_API_KEY"):
-        raise ValueError("GEMINI_API_KEY is required when judge_enabled=True")
+    config = _resolve_runtime_config(config)
+
+    # Resolve benchmark plugin (if specified)
+    benchmark_plugin = None
+    if config.benchmark:
+        from eval.benchmarks import get_plugin
+        benchmark_plugin = get_plugin(config.benchmark)
 
     resolved_dataset = _ensure_dataset_materialized(
         dataset_path=dataset_path,
         config=config,
     )
-    tasks = load_dataset(resolved_dataset)
+
+    if benchmark_plugin is not None:
+        # Plugins own row conversion, but they should still receive the materialized
+        # local dataset path when the engine fetched or restored it.
+        tasks = benchmark_plugin.load_cases(resolved_dataset)
+    else:
+        tasks = load_dataset(resolved_dataset)
+
+    if resolved_dataset is None:
+        resolved_dataset = DATASET_PATH
     if task_ids:
         tasks = [task for task in tasks if str(task.get("id")) in task_ids]
 
@@ -879,13 +1392,16 @@ async def _run_async_eval(
         for idx, task in enumerate(tasks)
         if _task_id(task, idx) not in completed_ids
     ]
-    remaining_tasks = [task for _, task in remaining]
     remaining_cases = [_to_case(task, idx, config) for idx, task in remaining]
     task_by_id = {
-        case.case_id: task for case, task in zip(remaining_cases, remaining_tasks, strict=True)
+        case.case_id: task for case, (_, task) in zip(remaining_cases, remaining, strict=True)
     }
+    conv_store = ConvStore(out.with_suffix(".conv.jsonl"))
     llm_id, client = _build_client(
-        config, remaining_cases=remaining_cases, remaining_tasks=remaining_tasks
+        config,
+        task_by_id=task_by_id,
+        conv_store=conv_store,
+        benchmark_plugin=benchmark_plugin,
     )
     weave_client = _init_weave(config)
     wb_run = _init_wandb(
@@ -909,15 +1425,16 @@ async def _run_async_eval(
         provider_tool_getter = get_tool_metrics
         provider_tool_resetter = reset_tool_metrics
         provider_tool_setter = set_tool_concurrency
-        provider_tool_setter(_cpu_limit(config.cpu_sem))
+        provider_tool_setter(_tool_limit(config))
         provider_tool_resetter()
 
     judge_case_limit = max(1, config.judge_sem) if config.judge_enabled else 1
     judge_criterion_workers = max(1, config.judge_criterion_workers)
     log.info(
         f"[ASYNC] Eval: {llm_id} ({config.client}) | {len(remaining_cases)}/{all_task_count} tasks "
-        f"| eval_sem={config.eval_sem} cpu_sem={config.cpu_sem}"
+        f"| eval_sem={config.eval_sem} cpu_sem={config.cpu_sem} runtime={_runtime_type(config)}"
         f" judge={'on' if config.judge_enabled else 'off'}"
+        f" judge_provider={config.judge_provider or 'default'}"
         f" judge_sem={judge_case_limit} judge_criterion_workers={judge_criterion_workers} | -> {out}"
     )
 
@@ -934,6 +1451,13 @@ async def _run_async_eval(
         ok=ok_count,
         failed=failed_count,
         started_at=started_at,
+        last_progress_at=started_at,
+        heartbeat_at=started_at,
+        current_in_flight_evals=0,
+        current_in_flight_tools=0,
+        current_in_flight_judges=0,
+        oldest_in_flight_eval_case_id=None,
+        oldest_in_flight_eval_age_s=None,
         wandb_project=_resolve_wandb_project(config),
         config=asdict(config),
     )
@@ -946,6 +1470,8 @@ async def _run_async_eval(
     judge_lock = asyncio.Lock()
     in_flight_judges = 0
     peak_in_flight_judges = 0
+    last_progress_at = started_at
+    active_eval_started_at: dict[str, float] = {}
 
     runner = Runner(
         llm_client=client,
@@ -966,18 +1492,94 @@ async def _run_async_eval(
         if storage:
             _schedule_sync_snapshot(storage, out, meta_path)
 
+    def _live_meta_updates(*, include_current_task: bool = False) -> dict[str, Any]:
+        now_wall = datetime.now(timezone.utc).isoformat()
+        now_perf = time.perf_counter()
+        oldest_case_id = None
+        oldest_age_s = None
+        if active_eval_started_at:
+            oldest_case_id, oldest_started = min(
+                active_eval_started_at.items(),
+                key=lambda item: item[1],
+            )
+            oldest_age_s = round(now_perf - oldest_started, 3)
+        updates: dict[str, Any] = {
+            "heartbeat_at": now_wall,
+            "last_progress_at": last_progress_at,
+            "current_in_flight_evals": runner.current_in_flight_evals,
+            "current_in_flight_tools": runner.current_in_flight_tools,
+            "current_in_flight_judges": in_flight_judges,
+            "oldest_in_flight_eval_case_id": oldest_case_id,
+            "oldest_in_flight_eval_age_s": oldest_age_s,
+        }
+        if include_current_task and oldest_case_id is not None:
+            updates["current_task"] = oldest_case_id
+        return updates
+
+    metadata_popper = getattr(client, "pop_case_metadata", None)
     metadata_getter = getattr(client, "get_case_metadata", None)
+    case_context_getter = getattr(client, "get_case_context", None)
+    case_releaser = getattr(client, "release_case", None)
     result_queue: asyncio.Queue[CaseResult | None] = asyncio.Queue()
     judge_sem = asyncio.Semaphore(judge_case_limit)
     persist_error: Exception | None = None
-
-    async def _maybe_judge(task: dict[str, Any], result: CaseResult, row: dict[str, Any]) -> None:
+    stop_heartbeat = asyncio.Event()
+    async def _score_case(
+        task: dict[str, Any],
+        result: CaseResult,
+        row: dict[str, Any],
+        *,
+        artifacts: dict[str, Any] | None = None,
+    ) -> None:
+        """Resolve scorer and apply it. Rubric scoring uses judge_sem; deterministic scorers run inline."""
         nonlocal in_flight_judges, peak_in_flight_judges
-        if not config.judge_enabled or result.status != "ok":
+
+        if result.status != "ok":
+            return
+
+        if benchmark_plugin is not None:
+            plugin_score = await asyncio.to_thread(
+                benchmark_plugin.score_case, task, result.output_text, artifacts,
+            )
+            if plugin_score is not None:
+                row["scoring"] = plugin_score.to_dict()
+                return
+
+        def _rubric_scorer_factory() -> RubricJudgeScorer:
+            return RubricJudgeScorer(
+                criterion_workers=judge_criterion_workers,
+                conv_store=conv_store,
+                judge_provider=config.judge_provider,
+                provider_config_path=config.provider_config_path,
+                repl_mode=config.repl_mode,
+                sandbox_template=config.sandbox_template,
+            )
+
+        scorer_task = task
+        if not config.judge_enabled and task.get("ground_truth") is not None:
+            scorer_task = dict(task)
+            scorer_task.pop("rubric", None)
+
+        scorer = resolve_scorer(
+            scorer_task,
+            rubric_scorer_factory=_rubric_scorer_factory if config.judge_enabled else None,
+        )
+
+        # Deterministic / custom scorers: off the event loop
+        if scorer.method != "rubric_judge":
+            scorer_result = await asyncio.to_thread(
+                scorer.score, scorer_task, result.output_text, artifacts,
+            )
+            row["scoring"] = scorer_result.to_dict()
+            return
+
+        # Rubric judge scorer: gate with judge_sem, run in thread
+        if not config.judge_enabled:
             return
         rubric = _sanitize_rubric(task.get("rubric"))
         if rubric is None:
             return
+
         async with judge_sem:
             async with judge_lock:
                 in_flight_judges += 1
@@ -990,6 +1592,11 @@ async def _run_async_eval(
                     result.output_text,
                     criterion_workers=judge_criterion_workers,
                     rubric=rubric,
+                    conv_store=conv_store,
+                    judge_provider=config.judge_provider,
+                    provider_config_path=config.provider_config_path,
+                    repl_mode=config.repl_mode,
+                    sandbox_template=config.sandbox_template,
                 )
             finally:
                 async with judge_lock:
@@ -997,32 +1604,69 @@ async def _run_async_eval(
 
         if eval_payload is not None:
             row["eval"] = eval_payload
+            row["scoring"] = {
+                "method": "rubric_judge",
+                "score": eval_payload.get("score", 0.0),
+                "detail": eval_payload,
+                "judge_provider": config.judge_provider,
+            }
 
     async def _persist_result(result: CaseResult) -> None:
-        nonlocal completed_count, ok_count, failed_count
+        nonlocal completed_count, ok_count, failed_count, last_progress_at
         nonlocal total_model_wait_s, total_tool_cpu_s, total_elapsed_s
 
         task = task_by_id[result.case_id]
-        llm_metadata = (
-            metadata_getter(result.case_id)
-            if callable(metadata_getter)
-            else None
-        )
+        llm_metadata = None
+        if callable(metadata_popper):
+            llm_metadata = metadata_popper(result.case_id)
+        elif callable(metadata_getter):
+            llm_metadata = metadata_getter(result.case_id)
+
         row = _result_row(
             task=task,
             result=result,
             llm_id=llm_id,
             llm_metadata=llm_metadata,
         )
+        case_context = case_context_getter(result.case_id) if callable(case_context_getter) else None
+        repl = case_context.config.get("_repl") if case_context is not None else None
+        tool_session = case_context.config.get("_tool_session") if case_context is not None else repl
+        tool_runtime = case_context.config.get("_tool_runtime") if case_context is not None else None
+        local_output_dir = None
+        if case_context is not None:
+            local_output_dir = case_context.config.get("_local_output_dir") or case_context.config.get("_output_dir")
+        if tool_session is not None and local_output_dir and hasattr(tool_session, "sync_outputs"):
+            await asyncio.to_thread(tool_session.sync_outputs, str(local_output_dir))
+        artifacts: dict[str, Any] = {}
+        if local_output_dir:
+            artifacts["output_dir"] = str(local_output_dir)
+        if repl is not None:
+            artifacts["repl"] = repl
+        if tool_session is not None:
+            artifacts["tool_session"] = tool_session
+        if tool_runtime is not None:
+            artifacts["tool_runtime"] = tool_runtime
         try:
-            await _maybe_judge(task, result, row)
+            await _score_case(task, result, row, artifacts=artifacts)
         except Exception as exc:  # noqa: BLE001
             row["judge_error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            task_by_id.pop(result.case_id, None)
+            if callable(case_releaser):
+                await asyncio.to_thread(case_releaser, result.case_id)
+
+        # Append judge summary to conv store
+        if conv_store and row.get("eval"):
+            conv_store.append_judge(str(task.get("id", "")), {"summary": row["eval"]})
+        elif conv_store and row.get("judge_error"):
+            conv_store.append_judge(str(task.get("id", "")), {"error": row["judge_error"]})
 
         async with write_lock:
             with out.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(row) + "\n")
                 handle.flush()
+            if conv_store:
+                await asyncio.to_thread(conv_store.flush)
 
             completed_count += 1
             total_model_wait_s += result.model_wait_s
@@ -1032,6 +1676,7 @@ async def _run_async_eval(
                 ok_count += 1
             else:
                 failed_count += 1
+            last_progress_at = datetime.now(timezone.utc).isoformat()
 
             _write_meta(
                 meta_path,
@@ -1045,6 +1690,7 @@ async def _run_async_eval(
                 total_model_wait_s=round(total_model_wait_s, 4),
                 total_tool_cpu_s=round(total_tool_cpu_s, 4),
                 total_elapsed_s=round(total_elapsed_s, 4),
+                **_live_meta_updates(),
             )
             _sync()
 
@@ -1058,10 +1704,11 @@ async def _run_async_eval(
                     "tool_cpu_s": result.tool_cpu_s,
                     "total_s": result.total_s,
                 }
+                scoring_payload = row.get("scoring")
+                if isinstance(scoring_payload, dict) and isinstance(scoring_payload.get("score"), (int, float)):
+                    wb_data["score"] = float(scoring_payload["score"])
                 eval_payload = row.get("eval")
                 if isinstance(eval_payload, dict):
-                    if isinstance(eval_payload.get("score"), (int, float)):
-                        wb_data["score"] = float(eval_payload["score"])
                     mandatory = eval_payload.get("mandatory")
                     if isinstance(mandatory, list) and mandatory:
                         mandatory_true = sum(1 for x in mandatory if bool(x))
@@ -1099,19 +1746,42 @@ async def _run_async_eval(
             finally:
                 result_queue.task_done()
 
+    async def _heartbeat_worker() -> None:
+        while not stop_heartbeat.is_set():
+            try:
+                await asyncio.wait_for(stop_heartbeat.wait(), timeout=HEARTBEAT_INTERVAL_S)
+            except asyncio.TimeoutError:
+                _write_meta(
+                    meta_path,
+                    **_live_meta_updates(),
+                )
+
+    async def _on_case_start(case: EvalCase, started_perf_s: float) -> None:
+        active_eval_started_at[case.case_id] = started_perf_s
+
+    async def _on_case_finish(case: EvalCase, _finished_perf_s: float) -> None:
+        active_eval_started_at.pop(case.case_id, None)
+
     worker_count = 0
     if remaining_cases:
+        scoring_worker_limit = _tool_limit(config) if benchmark_plugin is not None else 1
         worker_count = min(
             len(remaining_cases),
-            judge_case_limit if config.judge_enabled else 1,
+            max(judge_case_limit if config.judge_enabled else 1, scoring_worker_limit),
         )
     result_workers = [asyncio.create_task(_result_worker()) for _ in range(worker_count)]
+    heartbeat_task = asyncio.create_task(_heartbeat_worker())
 
     async def _on_case_complete(result: CaseResult) -> None:
         await result_queue.put(result)
 
     try:
-        await runner.run_cases(remaining_cases, on_case_complete=_on_case_complete)
+        await runner.run_cases(
+            remaining_cases,
+            on_case_complete=_on_case_complete,
+            on_case_start=_on_case_start,
+            on_case_finish=_on_case_finish,
+        )
         await result_queue.join()
         if persist_error is not None:
             raise persist_error
@@ -1126,7 +1796,21 @@ async def _run_async_eval(
             peak_in_flight_tools=_peak_tools(),
             peak_in_flight_judges=peak_in_flight_judges,
             finished_at=datetime.now(timezone.utc).isoformat(),
+            current_in_flight_evals=0,
+            current_in_flight_tools=0,
+            current_in_flight_judges=0,
+            oldest_in_flight_eval_case_id=None,
+            oldest_in_flight_eval_age_s=None,
+            heartbeat_at=datetime.now(timezone.utc).isoformat(),
+            last_progress_at=last_progress_at,
         )
+        if benchmark_plugin is not None and out.exists():
+            try:
+                benchmark_summary = benchmark_plugin.summarize_run(load_dataset(out))
+                if benchmark_summary is not None:
+                    _write_meta(meta_path, benchmark_summary=benchmark_summary)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(f"[ASYNC] benchmark summarize_run failed: {type(exc).__name__}: {exc}")
         if storage:
             _sync_to_storage(storage, out, meta_path)
 
@@ -1181,6 +1865,8 @@ async def _run_async_eval(
                         },
                     )
     finally:
+        stop_heartbeat.set()
+        await heartbeat_task
         for _ in result_workers:
             await result_queue.put(None)
         if result_workers:
